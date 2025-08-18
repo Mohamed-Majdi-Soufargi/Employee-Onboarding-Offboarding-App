@@ -1,11 +1,16 @@
-from flask import request, jsonify
-from .app import app, db
+from flask import Blueprint, request, jsonify
 from .models import User, LoginAudit
 from flask_jwt_extended import create_access_token
 from datetime import datetime
 import pyotp  # for MFA codes
 
-@app.route('/register', methods=['POST'])
+# Define the Blueprint
+routes = Blueprint("routes", __name__)
+
+# Initialize db here to avoid circular import
+from . import db
+
+@routes.route('/register', methods=['POST'])
 def register():
     data = request.get_json()
     if User.query.filter_by(username=data['username']).first():
@@ -22,7 +27,7 @@ def register():
     db.session.commit()
     return jsonify({"message": "User registered successfully"}), 201
 
-@app.route('/login', methods=['POST'])
+@routes.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
     user = User.query.filter_by(username=data['username']).first()
