@@ -10,6 +10,15 @@ from datetime import timedelta, datetime
 from datetime import timezone
 import random
 import string
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from decouple import config
+import logging
+
+# Configure logging for tests
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # Create the test app factory
 def create_test_app():
@@ -66,7 +75,55 @@ def create_test_app():
         return ''.join(random.choices(string.digits, k=length))
     
     def send_mfa_email(email, code):
-        return True  # Mock email sending for tests
+        """Send MFA code to the user's email with HTML and plain text versions."""
+        smtp_server = config('SMTP_SERVER', default='smtp.gmail.com')
+        smtp_port = config('SMTP_PORT', default=587, cast=int)
+        smtp_username = config('SMTP_USERNAME')
+        smtp_password = config('SMTP_PASSWORD')
+        
+        # Create a multipart email (HTML + plain text)
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = 'Your MFA Verification Code (Test)'
+        msg['From'] = smtp_username
+        msg['To'] = email
+        
+        # Plain text version
+        text = f"Your MFA code is: {code}\nThis code will expire in 5 minutes."
+        part1 = MIMEText(text, 'plain')
+        
+        # HTML version
+        html = f"""
+        <html>
+            <body>
+                <h2>Your MFA Verification Code (Test)</h2>
+                <p>Your verification code is: <strong>{code}</strong></p>
+                <p>This code will expire in 5 minutes.</p>
+                <p>If you did not request this code, please ignore this email.</p>
+            </body>
+        </html>
+        """
+        part2 = MIMEText(html, 'html')
+        
+        msg.attach(part1)
+        msg.attach(part2)
+        
+        try:
+            with smtplib.SMTP(smtp_server, smtp_port) as server:
+                server.set_debuglevel(1)  # Enable debug output for troubleshooting
+                server.starttls()
+                server.login(smtp_username, smtp_password)
+                server.send_message(msg)
+            logger.info(f"Test email sent successfully to {email} with MFA code {code}")
+            return True
+        except smtplib.SMTPAuthenticationError as e:
+            logger.error(f"SMTP authentication failed for {smtp_username}: {e}")
+            return False
+        except smtplib.SMTPException as e:
+            logger.error(f"SMTP error while sending email to {email}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error sending email to {email}: {e}")
+            return False
     
     # Register routes
     @test_app.route('/register', methods=['POST'])
@@ -163,7 +220,7 @@ def test_user(app):
     with app.app_context():
         user = app.User(
             username="testuser",
-            email="test@example.com",
+            email="medmajdisoufargi1@gmail.com",  # Use real email for testing
             password_hash=generate_password_hash("testpassword")
         )
         app.db.session.add(user)
@@ -174,7 +231,7 @@ def test_user(app):
 # Test User model password hashing and checking
 def test_user_password(app):
     with app.app_context():
-        user = app.User(username="testuser", email="test@example.com")
+        user = app.User(username="testuser2", email="test2@example.com")
         user.set_password("testpassword")
         assert user.check_password("testpassword") is True
         assert user.check_password("wrongpassword") is False
@@ -217,6 +274,7 @@ def test_login_valid(client, test_user, app):
         mfa_entry = app.MFACode.query.filter_by(user_id=test_user).first()
         assert mfa_entry is not None
         assert len(mfa_entry.code) == 6
+        logger.info(f"MFA code generated for test: {mfa_entry.code}")
 
 # Test login with invalid password
 def test_login_invalid_password(client, test_user, app):
