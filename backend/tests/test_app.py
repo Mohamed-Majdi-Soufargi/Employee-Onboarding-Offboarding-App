@@ -7,7 +7,9 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager
 from werkzeug.security import generate_password_hash
 from datetime import timedelta, datetime
-import pyotp
+from datetime import timezone
+import random
+import string
 
 # Create the test app factory
 def create_test_app():
@@ -30,7 +32,7 @@ def create_test_app():
         username = db.Column(db.String(80), unique=True, nullable=False)
         email = db.Column(db.String(120), unique=True, nullable=False)
         password_hash = db.Column(db.String(255), nullable=False)
-        mfa_secret = db.Column(db.String(32), nullable=False)
+        mfa_secret = db.Column(db.String(32), nullable=True)
         last_login = db.Column(db.DateTime, nullable=True)
         failed_attempts = db.Column(db.Integer, default=0)
         
@@ -43,15 +45,28 @@ def create_test_app():
     
     class LoginAudit(db.Model):
         id = db.Column(db.Integer, primary_key=True)
-        user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-        timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+        user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)  # Aligned with production
+        timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
         ip_address = db.Column(db.String(45))
         success = db.Column(db.Boolean, nullable=False)
+    
+    class MFACode(db.Model):
+        id = db.Column(db.Integer, primary_key=True)
+        user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+        code = db.Column(db.String(6), nullable=False)
+        expires_at = db.Column(db.DateTime, nullable=False)
     
     # Store models in app for access
     test_app.User = User
     test_app.LoginAudit = LoginAudit
+    test_app.MFACode = MFACode
     test_app.db = db
+    
+    def generate_mfa_code(length=6):
+        return ''.join(random.choices(string.digits, k=length))
+    
+    def send_mfa_email(email, code):
+        return True  # Mock email sending for tests
     
     # Register routes
     @test_app.route('/register', methods=['POST'])
@@ -59,18 +74,14 @@ def create_test_app():
         from flask import request, jsonify
         data = request.get_json()
         
-        # Check if username already exists
         if User.query.filter_by(username=data['username']).first():
             return jsonify({"message": "Username already exists"}), 400
         
-        # Create new user
         user = User(
             username=data['username'],
-            email=data['email'],
-            mfa_secret=pyotp.random_base32()
+            email=data['email']
         )
         user.set_password(data['password'])
-        
         db.session.add(user)
         db.session.commit()
         
@@ -79,41 +90,58 @@ def create_test_app():
     @test_app.route('/login', methods=['POST'])
     def login():
         from flask import request, jsonify
-        from flask_jwt_extended import create_access_token
-        
         data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
-        mfa_code = data.get('mfa_code')
+        user = User.query.filter_by(username=data['username']).first()
+        ip = request.remote_addr
         
-        user = User.query.filter_by(username=username).first()
-        
-        if not user or not user.check_password(password):
-            if user:
-                audit = LoginAudit(user_id=user.id, success=False)
-                db.session.add(audit)
-                db.session.commit()
-            return jsonify({"message": "Invalid username or password"}), 401
-        
-        # Verify MFA
-        if not mfa_code:
-            return jsonify({"message": "MFA verification failed"}), 401
-        
-        totp = pyotp.TOTP(user.mfa_secret)
-        if not totp.verify(mfa_code):
-            audit = LoginAudit(user_id=user.id, success=False)
+        if not user or not user.check_password(data['password']):
+            audit = LoginAudit(user_id=user.id if user else None, success=False, ip_address=ip)
             db.session.add(audit)
             db.session.commit()
-            return jsonify({"message": "MFA verification failed"}), 401
+            return jsonify({"message": "Invalid username or password"}), 401
         
-        # Successful login
-        user.last_login = datetime.utcnow()
-        user.failed_attempts = 0
-        audit = LoginAudit(user_id=user.id, success=True)
-        db.session.add(audit)
+        mfa_code = generate_mfa_code()
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        mfa_entry = MFACode(user_id=user.id, code=mfa_code, expires_at=expires_at)
+        db.session.add(mfa_entry)
         db.session.commit()
         
+        if not send_mfa_email(user.email, mfa_code):
+            return jsonify({"message": "Failed to send MFA code"}), 500
+        
+        return jsonify({"message": "MFA code sent to your email. Please verify."}), 200
+    
+    @test_app.route('/verify_mfa', methods=['POST'])
+    def verify_mfa():
+        from flask import request, jsonify
+        from flask_jwt_extended import create_access_token
+        data = request.get_json()
+        username = data.get('username')
+        mfa_code = data.get('mfa_code')
+        ip = request.remote_addr
+        
+        user = User.query.filter_by(username=username).first()
+        if not user:
+            return jsonify({"message": "User not found"}), 404
+        
+        mfa_entry = MFACode.query.filter_by(user_id=user.id, code=mfa_code).filter(
+            MFACode.expires_at > datetime.now(timezone.utc)
+        ).first()
+        
+        if not mfa_entry:
+            audit = LoginAudit(user_id=user.id, success=False, ip_address=ip)
+            db.session.add(audit)
+            db.session.commit()
+            return jsonify({"message": "Invalid or expired MFA code"}), 401
+        
         access_token = create_access_token(identity=user.id)
+        user.last_login = datetime.now(timezone.utc)
+        user.failed_attempts = 0
+        audit = LoginAudit(user_id=user.id, success=True, ip_address=ip)
+        db.session.add(audit)
+        db.session.delete(mfa_entry)
+        db.session.commit()
+        
         return jsonify({"access_token": access_token}), 200
     
     return test_app
@@ -132,13 +160,16 @@ def client(app):
 
 @pytest.fixture
 def test_user(app):
-    user = app.User(
-        username="testuser",
-        email="test@example.com",
-        password_hash=generate_password_hash("testpassword"),
-        mfa_secret=pyotp.random_base32()
-    )
-    return user
+    with app.app_context():
+        user = app.User(
+            username="testuser",
+            email="test@example.com",
+            password_hash=generate_password_hash("testpassword")
+        )
+        app.db.session.add(user)
+        app.db.session.commit()
+        user_id = user.id
+    return user_id  # Return user_id instead of the User object
 
 # Test User model password hashing and checking
 def test_user_password(app):
@@ -158,19 +189,13 @@ def test_register(client, app):
     assert response.status_code == 201
     assert response.json == {"message": "User registered successfully"}
     
-    # Verify user in database
     with app.app_context():
         user = app.User.query.filter_by(username='newuser').first()
         assert user is not None
         assert user.email == 'newuser@example.com'
-        assert user.mfa_secret is not None
 
 # Test duplicate username registration
 def test_register_duplicate_username(client, test_user, app):
-    with app.app_context():
-        app.db.session.add(test_user)
-        app.db.session.commit()
-    
     response = client.post('/register', json={
         'username': 'testuser',
         'email': 'different@example.com',
@@ -180,75 +205,99 @@ def test_register_duplicate_username(client, test_user, app):
     assert response.json == {"message": "Username already exists"}
 
 # Test login with valid credentials
-def test_login_valid(client, test_user, app, mocker):
-    with app.app_context():
-        app.db.session.add(test_user)
-        app.db.session.commit()
-        user_id = test_user.id  # Get the ID while in app context
-    
-    # Mock pyotp.TOTP.verify to simulate valid MFA
-    mocker.patch('pyotp.TOTP.verify', return_value=True)
-    
-    response = client.post('/login', json={
-        'username': 'testuser',
-        'password': 'testpassword',
-        'mfa_code': '123456'
-    })
-    assert response.status_code == 200
-    assert 'access_token' in response.json
-    
-    # Verify login audit
-    with app.app_context():
-        audit = app.LoginAudit.query.filter_by(user_id=user_id, success=True).first()
-        assert audit is not None
-
-# Test login with invalid password
-def test_login_invalid_password(client, test_user, app):
-    with app.app_context():
-        app.db.session.add(test_user)
-        app.db.session.commit()
-        user_id = test_user.id  # Get the ID while in app context
-    
-    response = client.post('/login', json={
-        'username': 'testuser',
-        'password': 'wrongpassword',
-        'mfa_code': '123456'
-    })
-    assert response.status_code == 401
-    assert response.json == {"message": "Invalid username or password"}
-    
-    # Verify login audit
-    with app.app_context():
-        audit = app.LoginAudit.query.filter_by(user_id=user_id, success=False).first()
-        assert audit is not None
-
-# Test login with invalid MFA code
-def test_login_invalid_mfa(client, test_user, app, mocker):
-    with app.app_context():
-        app.db.session.add(test_user)
-        app.db.session.commit()
-        user_id = test_user.id  # Get the ID while in app context
-    
-    # Mock pyotp.TOTP.verify to simulate invalid MFA
-    mocker.patch('pyotp.TOTP.verify', return_value=False)
-    
-    response = client.post('/login', json={
-        'username': 'testuser',
-        'password': 'testpassword',
-        'mfa_code': 'invalidcode'
-    })
-    assert response.status_code == 401
-    assert response.json == {"message": "MFA verification failed"}
-
-# Test login without MFA code when MFA is enabled
-def test_login_missing_mfa(client, test_user, app):
-    with app.app_context():
-        app.db.session.add(test_user)
-        app.db.session.commit()
-    
+def test_login_valid(client, test_user, app):
     response = client.post('/login', json={
         'username': 'testuser',
         'password': 'testpassword'
     })
+    assert response.status_code == 200
+    assert response.json == {"message": "MFA code sent to your email. Please verify."}
+    
+    with app.app_context():
+        mfa_entry = app.MFACode.query.filter_by(user_id=test_user).first()
+        assert mfa_entry is not None
+        assert len(mfa_entry.code) == 6
+
+# Test login with invalid password
+def test_login_invalid_password(client, test_user, app):
+    response = client.post('/login', json={
+        'username': 'testuser',
+        'password': 'wrongpassword'
+    })
     assert response.status_code == 401
-    assert response.json == {"message": "MFA verification failed"}
+    assert response.json == {"message": "Invalid username or password"}
+    
+    with app.app_context():
+        audit = app.LoginAudit.query.filter_by(user_id=test_user, success=False).first()
+        assert audit is not None
+
+# Test MFA verification with valid code
+def test_verify_mfa_valid(client, test_user, app):
+    with app.app_context():
+        mfa_code = "123456"
+        mfa_entry = app.MFACode(
+            user_id=test_user,
+            code=mfa_code,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)
+        )
+        app.db.session.add(mfa_entry)
+        app.db.session.commit()
+    
+    response = client.post('/verify_mfa', json={
+        'username': 'testuser',
+        'mfa_code': mfa_code
+    })
+    assert response.status_code == 200
+    assert 'access_token' in response.json
+    
+    with app.app_context():
+        audit = app.LoginAudit.query.filter_by(user_id=test_user, success=True).first()
+        assert audit is not None
+        mfa_entry = app.MFACode.query.filter_by(user_id=test_user, code=mfa_code).first()
+        assert mfa_entry is None  # Code should be deleted after use
+
+# Test MFA verification with invalid code
+def test_verify_mfa_invalid(client, test_user, app):
+    with app.app_context():
+        mfa_code = "123456"
+        mfa_entry = app.MFACode(
+            user_id=test_user,
+            code=mfa_code,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)
+        )
+        app.db.session.add(mfa_entry)
+        app.db.session.commit()
+    
+    response = client.post('/verify_mfa', json={
+        'username': 'testuser',
+        'mfa_code': 'wrongcode'
+    })
+    assert response.status_code == 401
+    assert response.json == {"message": "Invalid or expired MFA code"}
+    
+    with app.app_context():
+        audit = app.LoginAudit.query.filter_by(user_id=test_user, success=False).first()
+        assert audit is not None
+
+# Test MFA verification with expired code
+def test_verify_mfa_expired(client, test_user, app):
+    with app.app_context():
+        mfa_code = "123456"
+        mfa_entry = app.MFACode(
+            user_id=test_user,
+            code=mfa_code,
+            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1)  # Expired
+        )
+        app.db.session.add(mfa_entry)
+        app.db.session.commit()
+    
+    response = client.post('/verify_mfa', json={
+        'username': 'testuser',
+        'mfa_code': mfa_code
+    })
+    assert response.status_code == 401
+    assert response.json == {"message": "Invalid or expired MFA code"}
+    
+    with app.app_context():
+        audit = app.LoginAudit.query.filter_by(user_id=test_user, success=False).first()
+        assert audit is not None
