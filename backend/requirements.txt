@@ -6,3 +6,6 @@ Flask-JWT-Extended==4.6.0
 python-decouple==3.8
 pyotp==2.8.0
 pytest==7.4.2
+pytest-cov==4.1.0
+freezegun==1.2.2
+psycopg2-binary==2.9.9

@@ -27,8 +27,34 @@ def create_app():
     jwt.init_app(app)
     CORS(app)
 
+    # Import models here to avoid circular imports
+    from .models import HR, AuditLog
+
     # Register blueprints
     from .routes import routes
     app.register_blueprint(routes)
+
+    with app.app_context():
+        db.create_all()
+        # Create initial HR user if no HR users exist
+        if not db.session.query(HR).first():
+            initial_user = HR(
+                username='admin',
+                email='medmajdisoufargi1@gmail.com',
+                sponsor_email='none@example.com',  # No sponsor needed for initial user
+                is_active=True  # Active by default
+            )
+            initial_user.set_password('123')  # Strong initial password
+            db.session.add(initial_user)
+            audit = AuditLog(
+                type='initial_setup',
+                user_id=None,
+                success=True,
+                reason='Created initial HR user: admin',
+                ip_address='127.0.0.1'
+            )
+            db.session.add(audit)
+            db.session.commit()
+            print("Created initial HR user: username=admin, email=admin@example.com, password=Admin123!")
 
     return app
