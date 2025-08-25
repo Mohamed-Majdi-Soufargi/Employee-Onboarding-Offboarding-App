@@ -2,6 +2,7 @@ from . import db
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timezone
 import uuid
+from sqlalchemy.dialects.postgresql import BYTEA
 
 class User(db.Model):
     __tablename__ = 'users'
@@ -58,6 +59,7 @@ class AuditLog(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     type = db.Column(db.String(20), nullable=False)
     success = db.Column(db.Boolean, nullable=False)
+    mode = db.Column(db.String(20), nullable=True)  # Add this if needed
     reason = db.Column(db.String(100), nullable=True)
     ip_address = db.Column(db.String(45), nullable=False)
     timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
@@ -76,4 +78,35 @@ class SponsorApproval(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     sponsor_email = db.Column(db.String(120), nullable=False)
     approved = db.Column(db.Boolean, nullable=False)
+    timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+class WelcomeContent(db.Model):
+    __tablename__ = 'welcome_content'
+    id = db.Column(db.Integer, primary_key=True)
+    message = db.Column(db.Text, nullable=False)
+    encrypted_video_url = db.Column(BYTEA, nullable=False)  # Encrypted with pgcrypto
+
+class Document(db.Model):
+    __tablename__ = 'documents'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    file_name = db.Column(db.String(255), nullable=False)
+    file_type = db.Column(db.String(50), nullable=False)
+    encrypted_content = db.Column(BYTEA, nullable=False)  # Encrypted with pgcrypto
+    timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+class Policy(db.Model):
+    __tablename__ = 'policies'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    version = db.Column(db.String(50), nullable=False)
+    timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+class SignedPolicy(db.Model):
+    __tablename__ = 'signed_policies'
+    id = db.Column(db.Integer, primary_key=True)
+    policy_id = db.Column(db.Integer, db.ForeignKey('policies.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    encrypted_signed_content = db.Column(BYTEA, nullable=False)  # Encrypted PDF
     timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))

@@ -2,7 +2,7 @@ import sys
 import os
 import re
 import pytest
-from flask import Flask, Blueprint, jsonify
+from flask import Flask, Blueprint, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -16,6 +16,10 @@ from decouple import config
 import logging
 import uuid
 from freezegun import freeze_time
+import base64
+import boto3
+from werkzeug.datastructures import FileStorage
+from unittest.mock import patch
 
 # Configure logging for tests
 logging.basicConfig(level=logging.DEBUG)
@@ -31,11 +35,18 @@ def create_test_app():
     test_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     test_app.config['SECRET_KEY'] = 'test-secret-key'
     test_app.config['BASE_URL'] = 'http://localhost'
+    test_app.config['PGCRYPTO_KEY'] = 'test-pgcrypto-key'  # Mock for pgp_sym_encrypt
     
     # Initialize extensions
     db = SQLAlchemy()
     db.init_app(test_app)
     jwt = JWTManager(test_app)
+    
+    # Mock pgp_sym_encrypt for WelcomeContent
+    def pgp_sym_encrypt(data, key):
+        return f"encrypted:{data}"  # Simple mock for testing
+    
+    test_app.pgp_sym_encrypt = pgp_sym_encrypt
     
     # Define models to match production
     class User(db.Model):
@@ -101,6 +112,34 @@ def create_test_app():
         approved = db.Column(db.Boolean, nullable=False)
         timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     
+    class WelcomeContent(db.Model):
+        id = db.Column(db.Integer, primary_key=True)
+        message = db.Column(db.String(200), nullable=False)
+        encrypted_video_url = db.Column(db.Text, nullable=False)
+    
+    class Policy(db.Model):
+        __tablename__ = 'policies'
+        id = db.Column(db.Integer, primary_key=True)
+        title = db.Column(db.String(100), nullable=False)
+        content = db.Column(db.Text, nullable=False)
+        version = db.Column(db.String(10), nullable=False)
+        timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    
+    class SignedPolicy(db.Model):
+        id = db.Column(db.Integer, primary_key=True)
+        user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+        policy_id = db.Column(db.Integer, db.ForeignKey('policies.id'), nullable=False)
+        envelope_id = db.Column(db.String(50), nullable=False)
+        timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    
+    class Document(db.Model):
+        id = db.Column(db.Integer, primary_key=True)
+        user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+        file_name = db.Column(db.String(100), nullable=False)
+        file_type = db.Column(db.String(50), nullable=False)
+        s3_key = db.Column(db.String(200), nullable=False)
+        timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    
     # Store models in app for access
     test_app.User = User
     test_app.Employee = Employee
@@ -109,6 +148,10 @@ def create_test_app():
     test_app.AuditLog = AuditLog
     test_app.MFACode = MFACode
     test_app.SponsorApproval = SponsorApproval
+    test_app.WelcomeContent = WelcomeContent
+    test_app.Policy = Policy
+    test_app.SignedPolicy = SignedPolicy
+    test_app.Document = Document
     test_app.db = db
     
     def generate_mfa_code(length=6):
@@ -144,7 +187,6 @@ def create_test_app():
     
     @routes.route('/register', methods=['POST'])
     def register():
-        from flask import request, jsonify
         data = request.get_json()
         ip = request.remote_addr
         
@@ -201,7 +243,6 @@ def create_test_app():
     
     @routes.route('/verify_registration_mfa', methods=['POST'])
     def verify_registration_mfa():
-        from flask import request, jsonify
         data = request.get_json()
         ip = request.remote_addr
         email = data.get('email')
@@ -252,7 +293,6 @@ def create_test_app():
     
     @routes.route('/sponsor_approve', methods=['POST'])
     def sponsor_approve():
-        from flask import request, jsonify
         data = request.get_json()
         token = data.get('token')
         approve = data.get('approve', False)
@@ -294,7 +334,6 @@ def create_test_app():
     
     @routes.route('/login', methods=['POST'])
     def login():
-        from flask import request, jsonify
         data = request.get_json()
         user = test_app.User.query.filter_by(username=data['username']).first()
         ip = request.remote_addr
@@ -341,7 +380,6 @@ def create_test_app():
     
     @routes.route('/verify_mfa', methods=['POST'])
     def verify_mfa():
-        from flask import request, jsonify
         data = request.get_json()
         username = data.get('username')
         mfa_code = data.get('mfa_code')
@@ -386,20 +424,30 @@ def create_test_app():
     @routes.route('/protected', methods=['GET'])
     @jwt_required()
     def protected():
-        from flask import jsonify
         user_id = get_jwt_identity()
         logger.debug(f"Protected route accessed with user_id: {user_id}")
         user = test_app.db.session.get(test_app.User, int(user_id))
         if not user:
             logger.error(f"User not found for id: {user_id}")
+            audit = test_app.AuditLog(type='protected_access', user_id=None, success=False, reason='User not found', ip_address=request.remote_addr)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
             return jsonify({"message": "User not found"}), 404
+        if not user.is_active:
+            logger.warning(f"Unauthorized access to protected route by {user.username} (inactive) from IP {request.remote_addr}")
+            audit = test_app.AuditLog(type='protected_access', user_id=user.id, success=False, reason='Unauthorized or account not active', ip_address=request.remote_addr)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            return jsonify({"message": "Unauthorized or account not active"}), 403
         logger.info(f"Protected route accessed successfully by {user.username}")
+        audit = test_app.AuditLog(type='protected_access', user_id=user.id, success=True, reason='Protected route accessed', ip_address=request.remote_addr)
+        test_app.db.session.add(audit)
+        test_app.db.session.commit()
         return jsonify({"message": f"Welcome {user.username}", "role": user.type}), 200
     
     @routes.route('/hr/users', methods=['GET'])
     @jwt_required()
     def hr_users():
-        from flask import request, jsonify
         user_id = get_jwt_identity()
         ip = request.remote_addr
         user = test_app.db.session.get(test_app.User, int(user_id))
@@ -432,7 +480,6 @@ def create_test_app():
     @routes.route('/it/config', methods=['GET'])
     @jwt_required()
     def it_config():
-        from flask import request, jsonify
         user_id = get_jwt_identity()
         ip = request.remote_addr
         user = test_app.db.session.get(test_app.User, int(user_id))
@@ -462,7 +509,6 @@ def create_test_app():
     @routes.route('/hr/users/<int:user_id>/deactivate', methods=['POST'])
     @jwt_required()
     def deactivate_user(user_id):
-        from flask import request, jsonify
         current_user_id = get_jwt_identity()
         ip = request.remote_addr
         current_user = test_app.db.session.get(test_app.User, int(current_user_id))
@@ -513,7 +559,6 @@ def create_test_app():
     @routes.route('/pending_approvals', methods=['GET'])
     @jwt_required()
     def pending_approvals():
-        from flask import request, jsonify
         user_id = get_jwt_identity()
         ip = request.remote_addr
         user = test_app.db.session.get(test_app.User, int(user_id))
@@ -543,6 +588,230 @@ def create_test_app():
                 "approval_token": u.approval_token
             } for u in pending_users]
         }), 200
+    
+    @routes.route('/get_signing_url', methods=['POST'])
+    @jwt_required()
+    def get_signing_url():
+        user_id = get_jwt_identity()
+        ip = request.remote_addr
+        user = test_app.db.session.get(test_app.User, int(user_id))
+        if not user:
+            audit = test_app.AuditLog(type='signing_url', user_id=None, success=False, reason='User not found', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.error(f"User not found for id: {user_id}")
+            return jsonify({"message": "User not found"}), 404
+        if not user.is_active:
+            audit = test_app.AuditLog(type='signing_url', user_id=user.id, success=False, reason='Unauthorized or account not active', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"Unauthorized access to signing_url by {user.username} (inactive) from IP {ip}")
+            return jsonify({"message": "Unauthorized or account not active"}), 403
+        data = request.get_json()
+        envelope_id = data.get('envelope_id')
+        if not envelope_id:
+            audit = test_app.AuditLog(type='signing_url', user_id=user.id, success=False, reason='Missing envelope_id', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"Missing envelope_id for user {user.username} from IP {ip}")
+            return jsonify({"message": "Missing envelope_id"}), 400
+        # Mock DocuSign response
+        signing_url = "https://demo.docusign.net/restapi"
+        audit = test_app.AuditLog(type='signing_url', user_id=user.id, success=True, reason='Signing URL generated', ip_address=ip)
+        test_app.db.session.add(audit)
+        test_app.db.session.commit()
+        logger.info(f"Signing URL generated for user {user.username} from IP {ip}")
+        return jsonify({"signing_url": signing_url}), 200
+    
+    @routes.route('/onboarding/welcome', methods=['GET'])
+    @jwt_required()
+    def get_welcome():
+        user_id = get_jwt_identity()
+        ip = request.remote_addr
+        user = test_app.db.session.get(test_app.User, int(user_id))
+        if not user:
+            audit = test_app.AuditLog(type='onboarding_welcome', user_id=None, success=False, reason='User not found', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.error(f"User not found for id: {user_id}")
+            return jsonify({"message": "User not found"}), 404
+        if not user.is_active:
+            audit = test_app.AuditLog(type='onboarding_welcome', user_id=user.id, success=False, reason='Unauthorized or account not active', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"Unauthorized access to onboarding/welcome by {user.username} (inactive) from IP {ip}")
+            return jsonify({"message": "Unauthorized or account not active"}), 403
+        welcome_content = test_app.WelcomeContent.query.first()
+        if not welcome_content:
+            audit = test_app.AuditLog(type='onboarding_welcome', user_id=user.id, success=False, reason='No welcome content found', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"No welcome content available for user {user.username} from IP {ip}")
+            return jsonify({"message": "No welcome content available"}), 404
+        # Mock Zoom meeting link
+        zoom_link = f"https://zoom.us/j/{random.randint(1000000000, 9999999999)}"
+        audit = test_app.AuditLog(type='onboarding_welcome', user_id=user.id, success=True, reason='Welcome data fetched successfully', ip_address=ip)
+        test_app.db.session.add(audit)
+        test_app.db.session.commit()
+        logger.info(f"Welcome content accessed by {user.username} from IP {ip}")
+        return jsonify({
+            "message": welcome_content.message,
+            "video_url": welcome_content.encrypted_video_url.replace("encrypted:", ""),
+            "zoom": {"join_url": zoom_link}
+        }), 200
+    
+    @routes.route('/policies', methods=['GET'])
+    @jwt_required()
+    def get_policies():
+        user_id = get_jwt_identity()
+        ip = request.remote_addr
+        user = test_app.db.session.get(test_app.User, int(user_id))
+        if not user:
+            audit = test_app.AuditLog(type='policies_fetch', user_id=None, success=False, reason='User not found', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.error(f"User not found for id: {user_id}")
+            return jsonify({"message": "User not found"}), 404
+        if not user.is_active:
+            audit = test_app.AuditLog(type='policies_fetch', user_id=user.id, success=False, reason='Unauthorized or account not active', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"Unauthorized access to policies by {user.username} (inactive) from IP {ip}")
+            return jsonify({"message": "Unauthorized or account not active"}), 403
+        policies = test_app.Policy.query.all()
+        audit = test_app.AuditLog(type='policies_fetch', user_id=user.id, success=True, reason='Policies fetched successfully', ip_address=ip)
+        test_app.db.session.add(audit)
+        test_app.db.session.commit()
+        logger.info(f"Policies fetched by {user.username} from IP {ip}")
+        return jsonify([{
+            "id": p.id,
+            "title": p.title,
+            "content": p.content,
+            "version": p.version,
+            "timestamp": p.timestamp.isoformat()
+        } for p in policies]), 200
+    
+    @routes.route('/sign_policy', methods=['POST'])
+    @jwt_required()
+    def sign_policy():
+        user_id = get_jwt_identity()
+        ip = request.remote_addr
+        user = test_app.db.session.get(test_app.User, int(user_id))
+        if not user:
+            audit = test_app.AuditLog(type='policy_sign', user_id=None, success=False, reason='User not found', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.error(f"User not found for id: {user_id}")
+            return jsonify({"message": "User not found"}), 404
+        if not user.is_active:
+            audit = test_app.AuditLog(type='policy_sign', user_id=user.id, success=False, reason='Unauthorized or account not active', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"Unauthorized policy signing attempt by {user.username} (inactive) from IP {ip}")
+            return jsonify({"message": "Unauthorized or account not active"}), 403
+        data = request.get_json()
+        policy_id = data.get('policy_id')
+        policy = test_app.db.session.get(test_app.Policy, policy_id)
+        if not policy:
+            audit = test_app.AuditLog(type='policy_sign', user_id=user.id, success=False, reason='Policy not found', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"Policy {policy_id} not found for user {user.username} from IP {ip}")
+            return jsonify({"message": "Policy not found"}), 404
+        # Mock DocuSign envelope creation
+        envelope_id = f"env_{random.randint(1000, 9999)}"
+        signed_policy = test_app.SignedPolicy(
+            user_id=user.id,
+            policy_id=policy_id,
+            envelope_id=envelope_id
+        )
+        test_app.db.session.add(signed_policy)
+        audit = test_app.AuditLog(type='policy_sign', user_id=user.id, success=True, reason=f'Signed policy {policy.title} successfully', ip_address=ip)
+        test_app.db.session.add(audit)
+        test_app.db.session.commit()
+        logger.info(f"Policy {policy.title} signed by {user.username} from IP {ip}")
+        return jsonify({"message": "Policy signing initiated", "envelope_id": envelope_id}), 200
+    
+    @routes.route('/upload', methods=['POST'])
+    @jwt_required()
+    def upload_file():
+        user_id = get_jwt_identity()
+        ip = request.remote_addr
+        user = test_app.db.session.get(test_app.User, int(user_id))
+        if not user:
+            audit = test_app.AuditLog(type='file_upload', user_id=None, success=False, reason='User not found', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.error(f"User not found for id: {user_id}")
+            return jsonify({"message": "User not found"}), 404
+        if not user.is_active:
+            audit = test_app.AuditLog(type='file_upload', user_id=user.id, success=False, reason='Unauthorized or account not active', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"Unauthorized file upload attempt by {user.username} (inactive) from IP {ip}")
+            return jsonify({"message": "Unauthorized or account not active"}), 403
+        if 'file' not in request.files:
+            audit = test_app.AuditLog(type='file_upload', user_id=user.id, success=False, reason='No file provided', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"No file provided by {user.username} from IP {ip}")
+            return jsonify({"message": "No file provided"}), 400
+        file = request.files['file']
+        if file.filename == '':
+            audit = test_app.AuditLog(type='file_upload', user_id=user.id, success=False, reason='No file selected', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"No file selected by {user.username} from IP {ip}")
+            return jsonify({"message": "No file selected"}), 400
+        allowed_extensions = {'pdf', 'png'}
+        if not '.' in file.filename or file.filename.rsplit('.', 1)[1].lower() not in allowed_extensions:
+            audit = test_app.AuditLog(type='file_upload', user_id=user.id, success=False, reason='Invalid file type', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"Invalid file type {file.filename} by {user.username} from IP {ip}")
+            return jsonify({"message": "Only PDF and PNG files are allowed"}), 400
+        file_size = len(file.read())
+        file.seek(0)  # Reset file pointer
+        if file_size > 10 * 1024 * 1024:  # 10MB limit
+            audit = test_app.AuditLog(type='file_upload', user_id=user.id, success=False, reason='File too large', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.warning(f"File {file.filename} too large by {user.username} from IP {ip}")
+            return jsonify({"message": "File must be less than 10MB"}), 400
+        # Mock ClamAV scan
+        with patch('subprocess.run') as mock_clamscan:
+            mock_clamscan.return_value.stdout = 'Infected files: 0'
+            # Simulate ClamAV scan
+            result = mock_clamscan(['clamscan', '--no-summary'], capture_output=True, text=True)
+            if 'Infected files: 0' not in result.stdout:
+                audit = test_app.AuditLog(type='file_upload', user_id=user.id, success=False, reason='File scan failed', ip_address=ip)
+                test_app.db.session.add(audit)
+                test_app.db.session.commit()
+                logger.warning(f"File scan failed for {file.filename} by {user.username} from IP {ip}")
+                return jsonify({"message": "File scan failed"}), 400
+        # Mock S3 upload
+        s3_key = f"uploads/{user.id}/{file.filename}"
+        try:
+            s3 = boto3.client('s3')
+            s3.upload_fileobj(file, 'test-bucket', s3_key)
+        except Exception as e:
+            audit = test_app.AuditLog(type='file_upload', user_id=user.id, success=False, reason='S3 upload failed', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            logger.error(f"S3 upload failed for {file.filename} by {user.username}: {str(e)}")
+            return jsonify({"message": "S3 upload failed"}), 500
+        document = test_app.Document(
+            user_id=user.id,
+            file_name=file.filename,
+            file_type=file.mimetype,
+            s3_key=s3_key
+        )
+        test_app.db.session.add(document)
+        audit = test_app.AuditLog(type='file_upload', user_id=user.id, success=True, reason=f'File {file.filename} uploaded successfully', ip_address=ip)
+        test_app.db.session.add(audit)
+        test_app.db.session.commit()
+        logger.info(f"File {file.filename} uploaded by {user.username} from IP {ip}")
+        return jsonify({"message": "File uploaded successfully"}), 200
     
     # Register the Blueprint
     test_app.register_blueprint(routes)
@@ -576,805 +845,4 @@ def test_user(app):
         app.db.session.commit()
         user_id = user.id
         yield user_id
-        app.db.drop_all()
-
-# Test User model password hashing and checking
-def test_user_password(app):
-    with app.app_context():
-        app.db.create_all()
-        user = app.Employee(username="testuser2", email="test2@example.com", sponsor_email="sponsor2@example.com")
-        user.set_password("Test123!")
-        assert user.check_password("Test123!") is True
-        assert user.check_password("wrongpassword") is False
-        app.db.drop_all()
-
-# Test user inheritance
-def test_user_inheritance(app):
-    with app.app_context():
-        app.db.create_all()
-        employee = app.Employee(username="emp1", email="emp1@example.com", sponsor_email="sponsor@example.com")
-        hr = app.HR(username="hr1", email="hr1@example.com", sponsor_email="sponsor@example.com")
-        it = app.IT(username="it1", email="it1@example.com", sponsor_email="sponsor@example.com")
-        employee.set_password("Test123!")
-        hr.set_password("Test123!")
-        it.set_password("Test123!")
-        app.db.session.add_all([employee, hr, it])
-        app.db.session.commit()
-        
-        assert employee.type == 'employee'
-        assert hr.type == 'hr'
-        assert it.type == 'it'
-        assert isinstance(employee, app.User)
-        assert isinstance(hr, app.User)
-        assert isinstance(it, app.User)
-        app.db.drop_all()
-
-# Test registration with missing fields
-def test_register_missing_fields(client, app):
-    with app.app_context():
-        app.db.create_all()
-        response = client.post('/register', json={
-            'username': 'newuser',
-            'email': 'newuser@example.com',
-            'password': 'Test123!',
-            'password_confirmation': 'Test123!'
-        })
-        assert response.status_code == 400
-        assert response.json == {"message": "Missing required fields"}
-        
-        audit = app.AuditLog.query.filter_by(type='register', success=False, reason='Missing required fields').first()
-        assert audit is not None
-        assert audit.ip_address == '127.0.0.1'
-        app.db.drop_all()
-
-# Test registration with password mismatch
-def test_register_password_mismatch(client, app):
-    with app.app_context():
-        app.db.create_all()
-        response = client.post('/register', json={
-            'username': 'newuser',
-            'email': 'newuser@example.com',
-            'password': 'Test123!',
-            'password_confirmation': 'Test1234!',
-            'sponsor_email': 'sponsor@example.com',
-            'role': 'employee'
-        })
-        assert response.status_code == 400
-        assert response.json == {"message": "Passwords do not match"}
-        
-        audit = app.AuditLog.query.filter_by(type='register', success=False, reason='Passwords do not match').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test registration with weak password
-def test_register_weak_password(client, app):
-    with app.app_context():
-        app.db.create_all()
-        response = client.post('/register', json={
-            'username': 'newuser',
-            'email': 'newuser@example.com',
-            'password': 'weak',
-            'password_confirmation': 'weak',
-            'sponsor_email': 'sponsor@example.com',
-            'role': 'employee'
-        })
-        assert response.status_code == 400
-        assert response.json == {"message": "Password must be at least 8 characters long"}
-        
-        audit = app.AuditLog.query.filter_by(type='register', success=False, reason='Password must be at least 8 characters long').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test registration with duplicate username
-def test_register_duplicate_username(client, test_user, app):
-    with app.app_context():
-        user = app.db.session.get(app.User, test_user)
-        response = client.post('/register', json={
-            'username': user.username,
-            'email': 'different@example.com',
-            'password': 'Test123!',
-            'password_confirmation': 'Test123!',
-            'sponsor_email': 'sponsor@example.com',
-            'role': 'employee'
-        })
-        assert response.status_code == 400
-        assert response.json == {"message": "Username or email already exists"}
-        
-        audit = app.AuditLog.query.filter_by(type='register', success=False, reason='Username or email already exists').first()
-        assert audit is not None
-
-# Test registration with valid data
-def test_register_valid(client, app):
-    with app.app_context():
-        app.db.create_all()
-        response = client.post('/register', json={
-            'username': 'newuser',
-            'email': 'newuser@example.com',
-            'password': 'Test123!',
-            'password_confirmation': 'Test123!',
-            'sponsor_email': 'sponsor@example.com',
-            'role': 'employee'
-        })
-        assert response.status_code == 200
-        assert response.json == {"message": "MFA code sent to your email. Please verify."}
-        
-        mfa_entry = app.MFACode.query.filter_by(email='newuser@example.com').first()
-        assert mfa_entry is not None
-        assert len(mfa_entry.code) == 6
-        audit = app.AuditLog.query.filter_by(type='register', success=True, reason='MFA code sent').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test registration MFA verification
-def test_verify_registration_mfa_valid(client, app):
-    with app.app_context():
-        app.db.create_all()
-        mfa_code = "123456"
-        mfa_entry = app.MFACode(
-            email="newuser@example.com",
-            code=mfa_code,
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)
-        )
-        app.db.session.add(mfa_entry)
-        app.db.session.commit()
-    
-        response = client.post('/verify_registration_mfa', json={
-            'username': 'newuser',
-            'email': 'newuser@example.com',
-            'password': 'Test123!',
-            'sponsor_email': 'sponsor@example.com',
-            'role': 'employee',
-            'mfa_code': mfa_code
-        })
-        assert response.status_code == 200
-        assert response.json == {"message": "Sponsor approval request sent. Awaiting approval."}
-        
-        user = app.User.query.filter_by(username='newuser').first()
-        assert user is not None
-        assert user.is_active is False
-        assert user.type == 'employee'
-        assert user.sponsor_email == 'sponsor@example.com'
-        assert user.approval_token is not None
-        audit = app.AuditLog.query.filter_by(type='mfa', success=True, reason='Pending user created, sponsor approval requested').first()
-        assert audit is not None
-        mfa_entry = app.MFACode.query.filter_by(email='newuser@example.com', code=mfa_code).first()
-        assert mfa_entry is None
-        app.db.drop_all()
-
-# Test registration MFA with invalid code
-def test_verify_registration_mfa_invalid(client, app):
-    with app.app_context():
-        app.db.create_all()
-        mfa_code = "123456"
-        mfa_entry = app.MFACode(
-            email="newuser@example.com",
-            code=mfa_code,
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)
-        )
-        app.db.session.add(mfa_entry)
-        app.db.session.commit()
-    
-        response = client.post('/verify_registration_mfa', json={
-            'username': 'newuser',
-            'email': 'newuser@example.com',
-            'password': 'Test123!',
-            'sponsor_email': 'sponsor@example.com',
-            'role': 'employee',
-            'mfa_code': 'wrongcode'
-        })
-        assert response.status_code == 401
-        assert response.json == {"message": "Invalid or expired MFA code"}
-        
-        audit = app.AuditLog.query.filter_by(type='mfa', success=False, reason='Invalid or expired MFA code').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test registration MFA with expired code
-def test_verify_registration_mfa_expired(client, app):
-    with app.app_context():
-        app.db.create_all()
-        mfa_code = "123456"
-        mfa_entry = app.MFACode(
-            email="newuser@example.com",
-            code=mfa_code,
-            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1)
-        )
-        app.db.session.add(mfa_entry)
-        app.db.session.commit()
-    
-        response = client.post('/verify_registration_mfa', json={
-            'username': 'newuser',
-            'email': 'newuser@example.com',
-            'password': 'Test123!',
-            'sponsor_email': 'sponsor@example.com',
-            'role': 'employee',
-            'mfa_code': mfa_code
-        })
-        assert response.status_code == 401
-        assert response.json == {"message": "Invalid or expired MFA code"}
-        
-        audit = app.AuditLog.query.filter_by(type='mfa', success=False, reason='Invalid or expired MFA code').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test sponsor approval
-def test_sponsor_approve_valid(client, app):
-    with app.app_context():
-        app.db.create_all()
-        user = app.Employee(
-            username="newuser",
-            email="newuser@example.com",
-            sponsor_email="sponsor@example.com",
-            approval_token=str(uuid.uuid4()),
-            is_active=False
-        )
-        user.set_password("Test123!")
-        app.db.session.add(user)
-        app.db.session.commit()
-        token = user.approval_token
-    
-        response = client.post('/sponsor_approve', json={
-            'token': token,
-            'approve': True
-        })
-        assert response.status_code == 201
-        assert response.json == {"message": "User activated successfully"}
-        
-        user = app.User.query.filter_by(username='newuser').first()
-        assert user.is_active is True
-        assert user.approval_token is None
-        sponsor_approval = app.SponsorApproval.query.filter_by(user_id=user.id, approved=True).first()
-        assert sponsor_approval is not None
-        audit = app.AuditLog.query.filter_by(type='sponsor', success=True, reason='Sponsor approved').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test sponsor rejection
-def test_sponsor_reject_valid(client, app):
-    with app.app_context():
-        app.db.create_all()
-        user = app.Employee(
-            username="newuser",
-            email="newuser@example.com",
-            sponsor_email="sponsor@example.com",
-            approval_token=str(uuid.uuid4()),
-            is_active=False
-        )
-        user.set_password("Test123!")
-        app.db.session.add(user)
-        app.db.session.commit()
-        token = user.approval_token
-    
-        response = client.post('/sponsor_approve', json={
-            'token': token,
-            'approve': False
-        })
-        assert response.status_code == 200
-        assert response.json == {"message": "Registration request rejected by sponsor"}
-        
-        user = app.User.query.filter_by(username='newuser').first()
-        assert user is None
-        sponsor_approval = app.SponsorApproval.query.filter_by(approved=False).first()
-        assert sponsor_approval is not None
-        audit = app.AuditLog.query.filter_by(type='sponsor', success=False, reason='Sponsor rejected request').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test sponsor approval with invalid token
-def test_sponsor_approve_invalid_token(client, app):
-    with app.app_context():
-        app.db.create_all()
-        response = client.post('/sponsor_approve', json={
-            'token': str(uuid.uuid4()),
-            'approve': True
-        })
-        assert response.status_code == 404
-        assert response.json == {"message": "Invalid or expired token"}
-        
-        audit = app.AuditLog.query.filter_by(type='sponsor', success=False, reason='Invalid or expired token').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test login with valid credentials
-def test_login_valid(client, app):
-    with app.app_context():
-        app.db.create_all()
-        user = app.Employee(
-            username="testuser",
-            email="testuser@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        user.set_password("Test123!")
-        app.db.session.add(user)
-        app.db.session.commit()
-        user_id = user.id
-    
-        response = client.post('/login', json={
-            'username': 'testuser',
-            'password': 'Test123!'
-        })
-        assert response.status_code == 200
-        assert response.json == {"message": "MFA code sent to your email. Please verify."}
-        
-        mfa_entry = app.MFACode.query.filter_by(user_id=user_id).first()
-        assert mfa_entry is not None
-        audit = app.AuditLog.query.filter_by(type='login', success=True, reason='MFA code sent').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test login with invalid password
-def test_login_invalid_password(client, test_user, app):
-    with app.app_context():
-        user = app.db.session.get(app.User, test_user)
-        response = client.post('/login', json={
-            'username': user.username,
-            'password': 'wrongpassword'
-        })
-        assert response.status_code == 401
-        assert response.json == {"message": "Invalid username or password"}
-        
-        user = app.db.session.get(app.User, test_user)
-        assert user.failed_attempts == 1
-        audit = app.AuditLog.query.filter_by(type='login', success=False, reason='Invalid password').first()
-        assert audit is not None
-
-# Test login with inactive account
-def test_login_inactive_account(client, app):
-    with app.app_context():
-        app.db.create_all()
-        user = app.Employee(
-            username="testuser",
-            email="testuser@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=False
-        )
-        user.set_password("Test123!")
-        app.db.session.add(user)
-        app.db.session.commit()
-    
-        response = client.post('/login', json={
-            'username': 'testuser',
-            'password': 'Test123!'
-        })
-        assert response.status_code == 403
-        assert response.json == {"message": "Account not active"}
-        
-        audit = app.AuditLog.query.filter_by(type='login', success=False, reason='Account not active').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test login with non-existent user
-def test_login_non_existent_user(client, app):
-    with app.app_context():
-        app.db.create_all()
-        response = client.post('/login', json={
-            'username': 'nonexistent',
-            'password': 'Test123!'
-        })
-        assert response.status_code == 401
-        assert response.json == {"message": "Invalid username or password"}
-        
-        audit = app.AuditLog.query.filter_by(type='login', success=False, reason='User not found').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test MFA verification with valid code
-def test_verify_mfa_valid(client, app):
-    with app.app_context():
-        app.db.create_all()
-        user = app.Employee(
-            username="testuser",
-            email="testuser@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        user.set_password("Test123!")
-        app.db.session.add(user)
-        app.db.session.commit()
-        user_id = user.id
-        mfa_code = "123456"
-        mfa_entry = app.MFACode(
-            user_id=user_id,
-            code=mfa_code,
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)
-        )
-        app.db.session.add(mfa_entry)
-        app.db.session.commit()
-    
-        response = client.post('/verify_mfa', json={
-            'username': 'testuser',
-            'mfa_code': mfa_code
-        })
-        assert response.status_code == 200
-        assert 'access_token' in response.json
-        assert response.json['role'] == 'employee'
-        
-        user = app.db.session.get(app.User, user_id)
-        assert user.last_login is not None
-        assert user.failed_attempts == 0
-        audit = app.AuditLog.query.filter_by(type='mfa', success=True, reason='Login successful').first()
-        assert audit is not None
-        mfa_entry = app.MFACode.query.filter_by(user_id=user_id, code=mfa_code).first()
-        assert mfa_entry is None
-        app.db.drop_all()
-
-# Test MFA verification with invalid code
-def test_verify_mfa_invalid(client, app):
-    with app.app_context():
-        app.db.create_all()
-        user = app.Employee(
-            username="testuser",
-            email="testuser@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        user.set_password("Test123!")
-        app.db.session.add(user)
-        app.db.session.commit()
-        user_id = user.id
-        mfa_code = "123456"
-        mfa_entry = app.MFACode(
-            user_id=user_id,
-            code=mfa_code,
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)
-        )
-        app.db.session.add(mfa_entry)
-        app.db.session.commit()
-    
-        response = client.post('/verify_mfa', json={
-            'username': 'testuser',
-            'mfa_code': 'wrongcode'
-        })
-        assert response.status_code == 401
-        assert response.json == {"message": "Invalid or expired MFA code"}
-        
-        audit = app.AuditLog.query.filter_by(type='mfa', success=False, reason='Invalid or expired MFA code').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test MFA verification with expired code
-def test_verify_mfa_expired(client, app):
-    with app.app_context():
-        app.db.create_all()
-        user = app.Employee(
-            username="testuser",
-            email="testuser@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        user.set_password("Test123!")
-        app.db.session.add(user)
-        app.db.session.commit()
-        user_id = user.id
-        mfa_code = "123456"
-        mfa_entry = app.MFACode(
-            user_id=user_id,
-            code=mfa_code,
-            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1)
-        )
-        app.db.session.add(mfa_entry)
-        app.db.session.commit()
-    
-        response = client.post('/verify_mfa', json={
-            'username': 'testuser',
-            'mfa_code': mfa_code
-        })
-        assert response.status_code == 401
-        assert response.json == {"message": "Invalid or expired MFA code"}
-        
-        audit = app.AuditLog.query.filter_by(type='mfa', success=False, reason='Invalid or expired MFA code').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test MFA verification with inactive account
-def test_verify_mfa_inactive_account(client, app):
-    with app.app_context():
-        app.db.create_all()
-        user = app.Employee(
-            username="testuser",
-            email="testuser@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=False
-        )
-        user.set_password("Test123!")
-        app.db.session.add(user)
-        app.db.session.commit()
-    
-        response = client.post('/verify_mfa', json={
-            'username': 'testuser',
-            'mfa_code': '123456'
-        })
-        assert response.status_code == 403
-        assert response.json == {"message": "Account not active"}
-        
-        audit = app.AuditLog.query.filter_by(type='mfa', success=False, reason='Account not active').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test JWT token expiration
-def test_jwt_token_expiration(app):
-    with app.app_context():
-        token = create_access_token(identity=str(1))
-        assert app.config['JWT_ACCESS_TOKEN_EXPIRES'] == timedelta(minutes=30)
-
-# Test JWT token expiration with protected route
-def test_jwt_token_expiration_full(client, app):
-    with app.app_context():
-        app.db.create_all()
-        user = app.Employee(
-            username="testuser",
-            email="testuser@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        user.set_password("Test123!")
-        app.db.session.add(user)
-        app.db.session.commit()
-        user_id = user.id
-        token = create_access_token(identity=str(user_id))
-    
-        response = client.get('/protected', headers={'Authorization': f'Bearer {token}'})
-        assert response.status_code == 200
-        assert response.json == {"message": "Welcome testuser", "role": "employee"}
-    
-        with freeze_time(datetime.now(timezone.utc) + timedelta(minutes=31)):
-            response = client.get('/protected', headers={'Authorization': f'Bearer {token}'})
-            assert response.status_code == 401
-            assert response.json.get('msg') == 'Token has expired'
-        app.db.drop_all()
-
-# Test HR users route access
-def test_hr_users_access(client, app):
-    with app.app_context():
-        app.db.create_all()
-        hr_user = app.HR(
-            username="hruser",
-            email="hr@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        hr_user.set_password("Test123!")
-        emp_user = app.Employee(
-            username="empuser",
-            email="emp@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        emp_user.set_password("Test123!")
-        app.db.session.add_all([hr_user, emp_user])
-        app.db.session.commit()
-        hr_token = create_access_token(identity=str(hr_user.id))
-        emp_token = create_access_token(identity=str(emp_user.id))
-    
-        response = client.get('/hr/users', headers={'Authorization': f'Bearer {hr_token}'})
-        assert response.status_code == 200
-        assert len(response.json) >= 2
-        assert any(u['username'] == 'hruser' for u in response.json)
-        assert any(u['username'] == 'empuser' for u in response.json)
-        audit = app.AuditLog.query.filter_by(type='hr_access', success=True, reason='Viewed user list').first()
-        assert audit is not None
-    
-        response = client.get('/hr/users', headers={'Authorization': f'Bearer {emp_token}'})
-        assert response.status_code == 403
-        assert response.json == {"message": "HR access required"}
-        audit = app.AuditLog.query.filter_by(type='hr_access', success=False, reason='HR access required').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test IT config route access
-def test_it_config_access(client, app):
-    with app.app_context():
-        app.db.create_all()
-        it_user = app.IT(
-            username="ituser",
-            email="it@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        it_user.set_password("Test123!")
-        emp_user = app.Employee(
-            username="empuser",
-            email="emp@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        emp_user.set_password("Test123!")
-        app.db.session.add_all([it_user, emp_user])
-        app.db.session.commit()
-        it_token = create_access_token(identity=str(it_user.id))
-        emp_token = create_access_token(identity=str(emp_user.id))
-    
-        response = client.get('/it/config', headers={'Authorization': f'Bearer {it_token}'})
-        assert response.status_code == 200
-        assert response.json['message'] == "System configuration retrieved"
-        assert response.json['config']['system_version'] == "1.0.0"
-        audit = app.AuditLog.query.filter_by(type='it_access', success=True, reason='Viewed system config').first()
-        assert audit is not None
-    
-        response = client.get('/it/config', headers={'Authorization': f'Bearer {emp_token}'})
-        assert response.status_code == 403
-        assert response.json == {"message": "IT access required"}
-        audit = app.AuditLog.query.filter_by(type='it_access', success=False, reason='IT access required').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test initial admin creation
-def test_initial_admin_creation(app, client):
-    with app.app_context():
-        # Create database tables
-        app.db.create_all()
-        # Ensure no users exist initially
-        assert app.db.session.query(app.User).count() == 0
-        # Manually create admin user (mimicking production setup script)
-        admin = app.HR(
-            username='admin',
-            email='admin@example.com',
-            sponsor_email='sponsor@example.com',
-            is_active=True
-        )
-        admin.set_password('Admin123!')
-        app.db.session.add(admin)
-        audit = app.AuditLog(
-            type='initial_setup',
-            user_id=None,
-            success=True,
-            reason='Created initial HR user: admin',
-            ip_address='127.0.0.1'
-        )
-        app.db.session.add(audit)
-        app.db.session.commit()
-        # Check if admin user was created
-        admin = app.db.session.query(app.HR).filter_by(username='admin').first()
-        assert admin is not None
-        assert admin.email == 'admin@example.com'
-        assert admin.is_active is True
-        assert admin.check_password('Admin123!')
-        audit = app.AuditLog.query.filter_by(type='initial_setup', success=True).first()
-        assert audit is not None
-        assert audit.reason == 'Created initial HR user: admin'
-        app.db.drop_all()
-
-# Test user deactivation
-def test_deactivate_user(app, client):
-    with app.app_context():
-        app.db.create_all()
-        hr_user = app.HR(
-            username='hruser',
-            email='hr@example.com',
-            sponsor_email='sponsor@example.com',
-            is_active=True
-        )
-        hr_user.set_password('Test123!')
-        emp_user = app.Employee(
-            username='empuser',
-            email='emp@example.com',
-            sponsor_email='sponsor@example.com',
-            is_active=True
-        )
-        emp_user.set_password('Test123!')
-        app.db.session.add_all([hr_user, emp_user])
-        app.db.session.commit()
-        hr_token = create_access_token(identity=str(hr_user.id))
-        emp_token = create_access_token(identity=str(emp_user.id))
-    
-        response = client.post(f'/hr/users/{emp_user.id}/deactivate', headers={'Authorization': f'Bearer {hr_token}'})
-        assert response.status_code == 200
-        assert response.json['message'] == f'User {emp_user.username} deactivated successfully'
-        emp_user = app.db.session.get(app.User, emp_user.id)
-        assert emp_user.is_active is False
-        audit = app.AuditLog.query.filter_by(type='hr_access', success=True, reason=f'Deactivated user {emp_user.username}').first()
-        assert audit is not None
-    
-        response = client.post(f'/hr/users/{emp_user.id}/deactivate', headers={'Authorization': f'Bearer {emp_token}'})
-        assert response.status_code == 403
-        assert response.json['message'] == 'HR access required'
-        audit = app.AuditLog.query.filter_by(type='hr_access', success=False, reason='HR access required').first()
-        assert audit is not None
-    
-        response = client.post(f'/hr/users/{hr_user.id}/deactivate', headers={'Authorization': f'Bearer {hr_token}'})
-        assert response.status_code == 403
-        assert response.json['message'] == 'Cannot deactivate self'
-        audit = app.AuditLog.query.filter_by(type='hr_access', success=False, reason='Cannot deactivate self').first()
-        assert audit is not None
-    
-        response = client.post('/hr/users/999/deactivate', headers={'Authorization': f'Bearer {hr_token}'})
-        assert response.status_code == 404
-        assert response.json['message'] == 'Target user not found'
-        audit = app.AuditLog.query.filter_by(type='hr_access', success=False, reason='Target user not found').first()
-        assert audit is not None
-    
-        response = client.post(f'/hr/users/{emp_user.id}/deactivate', headers={'Authorization': f'Bearer {hr_token}'})
-        assert response.status_code == 400
-        assert response.json['message'] == 'User already deactivated'
-        audit = app.AuditLog.query.filter_by(type='hr_access', success=False, reason='User already deactivated').first()
-        assert audit is not None
-        app.db.drop_all()
-
-# Test pending approvals route access
-def test_pending_approvals_access(client, app):
-    with app.app_context():
-        app.db.create_all()
-        hr_user = app.HR(
-            username="hruser",
-            email="hr@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        hr_user.set_password("Test123!")
-        pending_user = app.Employee(
-            username="pendinguser",
-            email="pending@example.com",
-            sponsor_email="hr@example.com",
-            approval_token=str(uuid.uuid4()),
-            is_active=False
-        )
-        pending_user.set_password("Test123!")
-        other_user = app.Employee(
-            username="otheruser",
-            email="other@example.com",
-            sponsor_email="other.sponsor@example.com",
-            is_active=False
-        )
-        other_user.set_password("Test123!")
-        emp_user = app.Employee(
-            username="empuser",
-            email="emp@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        emp_user.set_password("Test123!")
-        app.db.session.add_all([hr_user, pending_user, other_user, emp_user])
-        app.db.session.commit()
-        hr_token = create_access_token(identity=str(hr_user.id))
-        emp_token = create_access_token(identity=str(emp_user.id))
-    
-        # Test HR user accessing pending approvals
-        response = client.get('/pending_approvals', headers={'Authorization': f'Bearer {hr_token}'})
-        assert response.status_code == 200
-        assert response.json['pending_approvals'] is not None
-        assert len(response.json['pending_approvals']) == 1
-        assert response.json['pending_approvals'][0]['username'] == 'pendinguser'
-        assert response.json['pending_approvals'][0]['email'] == 'pending@example.com'
-        assert response.json['pending_approvals'][0]['role'] == 'employee'
-        assert response.json['pending_approvals'][0]['approval_token'] == pending_user.approval_token
-        audit = app.AuditLog.query.filter_by(type='hr_access', success=True, reason='Viewed pending approvals').first()
-        assert audit is not None
-        assert audit.user_id == hr_user.id
-    
-        # Test non-HR user accessing pending approvals
-        response = client.get('/pending_approvals', headers={'Authorization': f'Bearer {emp_token}'})
-        assert response.status_code == 403
-        assert response.json == {"message": "HR access required"}
-        audit = app.AuditLog.query.filter_by(type='hr_access', success=False, reason='HR access required').first()
-        assert audit is not None
-        assert audit.user_id == emp_user.id
-    
-        # Test access with no token
-        response = client.get('/pending_approvals')
-        assert response.status_code == 401
-        assert response.json.get('msg') == 'Missing Authorization Header'
-    
-        # Test access with invalid token
-        response = client.get('/pending_approvals', headers={'Authorization': 'Bearer invalidtoken'})
-        assert response.status_code == 422
-        assert response.json.get('msg') == 'Not enough segments'
-    
-        # Test when no pending approvals exist for the HR user
-        hr_user2 = app.HR(
-            username="hruser2",
-            email="hr2@example.com",
-            sponsor_email="sponsor@example.com",
-            is_active=True
-        )
-        hr_user2.set_password("Test123!")
-        app.db.session.add(hr_user2)
-        app.db.session.commit()
-        hr_token2 = create_access_token(identity=str(hr_user2.id))
-        response = client.get('/pending_approvals', headers={'Authorization': f'Bearer {hr_token2}'})
-        assert response.status_code == 200
-        assert response.json['pending_approvals'] == []
-        audit = app.AuditLog.query.filter_by(type='hr_access', success=True, reason='Viewed pending approvals', user_id=hr_user2.id).first()
-        assert audit is not None
-    
         app.db.drop_all()

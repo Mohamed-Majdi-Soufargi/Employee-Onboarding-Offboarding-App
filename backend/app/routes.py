@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify
-from .models import User, AuditLog, MFACode, SponsorApproval, Employee, HR, IT
+from .models import User, AuditLog, MFACode, SponsorApproval, Employee, HR, IT, WelcomeContent, Document, Policy, SignedPolicy
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from datetime import datetime, timedelta, timezone
 import random
@@ -11,6 +11,14 @@ from decouple import config
 import logging
 import re
 import uuid
+import jwt  # python-jwt for Zoom API
+import requests
+import boto3
+from sqlalchemy import text
+import magic  # python-magic for file type
+import subprocess  # For ClamAV
+from werkzeug.utils import secure_filename
+from docusign_esign import ApiClient, EnvelopesApi, Document, Signer, SignHere, Tabs, Recipients, EnvelopeDefinition
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -532,3 +540,446 @@ def verify_mfa():
     
     logger.info(f"Successful MFA verification for {username} from IP {ip}")
     return jsonify({"access_token": access_token, "role": user.type}), 200
+
+# AWS S3 client (configure with your credentials in .env)
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=config('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=config('AWS_SECRET_ACCESS_KEY')
+)
+
+# Zoom API configuration
+ZOOM_API_BASE = 'https://api.zoom.us/v2'
+
+def create_zoom_meeting(access_token, topic='Virtual Team Introduction', start_time='2025-08-26T10:00:00Z'):
+    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+    data = {
+        'topic': topic,
+        'type': 2,  # Scheduled meeting
+        'start_time': start_time,
+        'duration': 60,
+        'settings': {'join_before_host': True}
+    }
+    response = requests.post(f'{ZOOM_API_BASE}/users/me/meetings', headers=headers, json=data)
+    if response.status_code == 201:
+        meeting = response.json()
+        return {'join_url': meeting['join_url'], 'meeting_id': meeting['id']}
+    else:
+        logger.error(f"Failed to create Zoom meeting: {response.text}")
+        raise Exception('Failed to create Zoom meeting')
+
+# Helper to encrypt/decrypt with pgcrypto
+def store_welcome_content(message, video_url):
+    encrypted_url = db.session.execute(
+        text("SELECT pgp_sym_encrypt(:url, :key)"),
+        {'url': video_url, 'key': config('PGCRYPTO_KEY')}
+    ).scalar()
+    new_content = WelcomeContent(message=message, encrypted_video_url=encrypted_url)
+    db.session.add(new_content)
+    db.session.commit()
+    return new_content.id
+
+def get_welcome_content():
+    result = db.session.execute(
+        text("SELECT message, pgp_sym_decrypt(encrypted_video_url, :key) as video_url FROM welcome_content LIMIT 1"),
+        {'key': config('PGCRYPTO_KEY')}
+    ).fetchone()
+    if not result:
+        return None
+    return {'message': result[0], 'video_url': result[1]}
+
+@routes.route('/onboarding/welcome', methods=['GET'])
+@jwt_required()
+def get_welcome():
+    ip = request.remote_addr
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    
+    if not user or not user.is_active:
+        audit = AuditLog(
+            type='onboarding_welcome',
+            user_id=user_id,
+            success=False,
+            reason='Unauthorized or inactive user',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Failed to fetch welcome data for user_id {user_id} from IP {ip}")
+        return jsonify({"message": "Unauthorized or account not active"}), 403
+
+    welcome_data = get_welcome_content()
+    if not welcome_data:
+        audit = AuditLog(
+            type='onboarding_welcome',
+            user_id=user_id,
+            success=False,
+            reason='No welcome content found',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"No welcome content found for user_id {user_id} from IP {ip}")
+        return jsonify({"message": "No welcome content available"}), 404
+
+    # Zoom meeting creation (assume access_token fetched via OAuth; simplified here)
+    try:
+        zoom_access_token = config('ZOOM_ACCESS_TOKEN')  # Add to .env; implement OAuth in production
+        zoom_details = create_zoom_meeting(zoom_access_token)
+    except Exception as e:
+        audit = AuditLog(
+            type='onboarding_welcome',
+            user_id=user_id,
+            success=False,
+            reason=f'Failed to create Zoom meeting: {str(e)}',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.error(f"Zoom meeting creation failed for user_id {user_id}: {str(e)}")
+        return jsonify({"message": "Failed to create Zoom meeting"}), 500
+
+    audit = AuditLog(
+        type='onboarding_welcome',
+        user_id=user_id,
+        success=True,
+        reason='Welcome data fetched successfully',
+        ip_address=ip
+    )
+    db.session.add(audit)
+    db.session.commit()
+    logger.info(f"Welcome data fetched for {user.username} from IP {ip}")
+
+    return jsonify({
+        'message': welcome_data['message'],
+        'video_url': welcome_data['video_url'],
+        'zoom': zoom_details
+    }), 200
+
+def scan_for_malware(file_path):
+    try:
+        result = subprocess.run(['clamscan', file_path], capture_output=True, text=True)
+        if 'Infected files: 0' not in result.stdout:
+            raise Exception('Malware detected')
+        return True
+    except Exception as e:
+        logger.error(f"Malware scan failed: {str(e)}")
+        raise e
+
+@routes.route('/upload', methods=['POST'])
+@jwt_required()
+def upload_file():
+    ip = request.remote_addr
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    
+    if not user or not user.is_active:
+        audit = AuditLog(
+            type='file_upload',
+            user_id=user_id,
+            success=False,
+            reason='Unauthorized or inactive user',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Failed file upload for user_id {user_id} from IP {ip}: unauthorized")
+        return jsonify({"message": "Unauthorized or account not active"}), 403
+
+    if 'file' not in request.files:
+        audit = AuditLog(type='file_upload', user_id=user_id, success=False, reason='No file provided', ip_address=ip)
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Failed file upload for {user.username} from IP {ip}: no file")
+        return jsonify({"message": "No file provided"}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        audit = AuditLog(type='file_upload', user_id=user_id, success=False, reason='No file selected', ip_address=ip)
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Failed file upload for {user.username} from IP {ip}: no file selected")
+        return jsonify({"message": "No file selected"}), 400
+
+    # Validate size and type
+    file_content = file.read()
+    if len(file_content) > 10 * 1024 * 1024:  # <10MB
+        audit = AuditLog(type='file_upload', user_id=user_id, success=False, reason='File too large', ip_address=ip)
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Failed file upload for {user.username} from IP {ip}: file too large")
+        return jsonify({"message": "File must be less than 10MB"}), 400
+
+    file.seek(0)  # Reset stream
+    file_type = magic.from_buffer(file.read(2048), mime=True)
+    file.seek(0)
+    if file_type not in ['application/pdf', 'image/png']:
+        audit = AuditLog(type='file_upload', user_id=user_id, success=False, reason='Invalid file type', ip_address=ip)
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Failed file upload for {user.username} from IP {ip}: invalid file type {file_type}")
+        return jsonify({"message": "Only PDF and PNG files are allowed"}), 400
+
+    # Save file temporarily for scanning
+    temp_path = f'/tmp/{secure_filename(file.filename)}'
+    file.save(temp_path)
+    try:
+        scan_for_malware(temp_path)
+    except Exception as e:
+        audit = AuditLog(type='file_upload', user_id=user_id, success=False, reason=f'Malware scan failed: {str(e)}', ip_address=ip)
+        db.session.add(audit)
+        db.session.commit()
+        logger.error(f"Malware scan failed for {user.username} from IP {ip}: {str(e)}")
+        return jsonify({"message": "File failed malware scan"}), 400
+
+    # Encrypt and store
+    encrypted_content = db.session.execute(
+        text("SELECT pgp_sym_encrypt(:content, :key)"),
+        {'content': file_content, 'key': config('PGCRYPTO_KEY')}
+    ).scalar()
+    
+    new_doc = Document(
+        user_id=user_id,
+        file_name=secure_filename(file.filename),
+        file_type=file_type,
+        encrypted_content=encrypted_content
+    )
+    db.session.add(new_doc)
+    db.session.commit()
+
+    # Clean up
+    import os
+    os.remove(temp_path)
+
+    audit = AuditLog(
+        type='file_upload',
+        user_id=user_id,
+        success=True,
+        reason=f'File {file.filename} uploaded successfully',
+        ip_address=ip
+    )
+    db.session.add(audit)
+    db.session.commit()
+    logger.info(f"File {file.filename} uploaded by {user.username} from IP {ip}")
+
+    return jsonify({"message": "File uploaded successfully"}), 200
+
+# DocuSign setup
+def get_docusign_client():
+    api_client = ApiClient()
+    api_client.host = 'https://demo.docusign.net/restapi'  # Sandbox
+    api_client.set_default_header('Authorization', f'Bearer {config("DOCUSIGN_ACCESS_TOKEN")}')
+    return api_client
+
+@routes.route('/policies', methods=['GET'])
+@jwt_required()
+def get_policies():
+    ip = request.remote_addr
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    
+    if not user or not user.is_active:
+        audit = AuditLog(
+            type='policies_fetch',
+            user_id=user_id,
+            success=False,
+            reason='Unauthorized or inactive user',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Failed to fetch policies for user_id {user_id} from IP {ip}: unauthorized")
+        return jsonify({"message": "Unauthorized or account not active"}), 403
+
+    policies = Policy.query.all()
+    audit = AuditLog(
+        type='policies_fetch',
+        user_id=user_id,
+        success=True,
+        reason='Policies fetched successfully',
+        ip_address=ip
+    )
+    db.session.add(audit)
+    db.session.commit()
+    logger.info(f"Policies fetched for {user.username} from IP {ip}")
+
+    return jsonify([{
+        'id': p.id,
+        'title': p.title,
+        'content': p.content,
+        'version': p.version
+    } for p in policies]), 200
+
+@routes.route('/sign_policy', methods=['POST'])
+@jwt_required()
+def sign_policy():
+    ip = request.remote_addr
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    data = request.get_json()
+    policy_id = data.get('policy_id')
+    
+    if not user or not user.is_active:
+        audit = AuditLog(
+            type='policy_sign',
+            user_id=user_id,
+            success=False,
+            reason='Unauthorized or inactive user',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Failed policy signing for user_id {user_id} from IP {ip}: unauthorized")
+        return jsonify({"message": "Unauthorized or account not active"}), 403
+
+    policy = Policy.query.get(policy_id)
+    if not policy:
+        audit = AuditLog(
+            type='policy_sign',
+            user_id=user_id,
+            success=False,
+            reason='Policy not found',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Failed policy signing for user_id {user_id} from IP {ip}: policy {policy_id} not found")
+        return jsonify({"message": "Policy not found"}), 404
+
+    # DocuSign envelope
+    try:
+        api_client = get_docusign_client()
+        envelopes_api = EnvelopesApi(api_client)
+        
+        # Assume policy.content is base64-encoded PDF or generate PDF
+        doc = Document(
+            document_base64=policy.content.encode(),  # Adjust if content is text; use PDF generation if needed
+            name=f'{policy.title}.pdf',
+            file_extension='pdf',
+            document_id='1'
+        )
+        signer = Signer(
+            email=user.email,
+            name=user.username,
+            recipient_id='1',
+            routing_order='1'
+        )
+        sign_here = SignHere(
+            document_id='1',
+            page_number='1',
+            recipient_id='1',
+            tab_label='SignHere',
+            x_position='200',
+            y_position='200'
+        )
+        tabs = Tabs(sign_here_tabs=[sign_here])
+        signer.tabs = tabs
+        recipients = Recipients(signers=[signer])
+        envelope_definition = EnvelopeDefinition(
+            email_subject=f'Please sign {policy.title}',
+            documents=[doc],
+            recipients=recipients,
+            status='sent'
+        )
+        envelope_summary = envelopes_api.create_envelope(config('DOCUSIGN_ACCOUNT_ID'), envelope_definition=envelope_definition)
+        
+        # Store envelope ID for webhook/polling
+        # For simplicity, assume signed PDF is returned via webhook; placeholder for encryption
+        # In production, use webhook to capture signed_content
+        signed_content = b'signed_pdf_bytes'  # Replace with actual signed content from webhook
+        encrypted_signed = db.session.execute(
+            text("SELECT pgp_sym_encrypt(:content, :key)"),
+            {'content': signed_content, 'key': config('PGCRYPTO_KEY')}
+        ).scalar()
+        
+        new_signed_policy = SignedPolicy(
+            policy_id=policy_id,
+            user_id=user_id,
+            encrypted_signed_content=encrypted_signed
+        )
+        db.session.add(new_signed_policy)
+        db.session.commit()
+
+        audit = AuditLog(
+            type='policy_sign',
+            user_id=user_id,
+            success=True,
+            reason=f'Signed policy {policy.title} successfully',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.info(f"Policy {policy.title} signed by {user.username} from IP {ip}")
+
+        return jsonify({"message": "Policy signing initiated", "envelope_id": envelope_summary.envelope_id}), 200
+    except Exception as e:
+        audit = AuditLog(
+            type='policy_sign',
+            user_id=user_id,
+            success=False,
+            reason=f'Failed to initiate signing: {str(e)}',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.error(f"Failed to sign policy {policy_id} for {user.username}: {str(e)}")
+        return jsonify({"message": "Failed to initiate policy signing"}), 500
+
+@routes.route('/get_signing_url', methods=['POST'])
+@jwt_required()
+def get_signing_url():
+    ip = request.remote_addr
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    data = request.get_json()
+    envelope_id = data.get('envelope_id')
+    
+    if not user or not user.is_active:
+        audit = AuditLog(
+            type='signing_url',
+            user_id=user_id,
+            success=False,
+            reason='Unauthorized or inactive user',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Failed to fetch signing URL for user_id {user_id} from IP {ip}: unauthorized")
+        return jsonify({"message": "Unauthorized or account not active"}), 403
+
+    try:
+        api_client = get_docusign_client()
+        envelopes_api = EnvelopesApi(api_client)
+        recipient_view = envelopes_api.create_recipient_view(
+            config('DOCUSIGN_ACCOUNT_ID'),
+            envelope_id,
+            recipient_view_request={
+                'user_name': user.username,
+                'email': user.email,
+                'recipient_id': '1',
+                'return_url': config('BASE_URL') + '/dashboard'  # Redirect after signing
+            }
+        )
+        audit = AuditLog(
+            type='signing_url',
+            user_id=user_id,
+            success=True,
+            reason='Signing URL generated',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.info(f"Signing URL generated for {user.username} from IP {ip}")
+        return jsonify({"signing_url": recipient_view.url}), 200
+    except Exception as e:
+        audit = AuditLog(
+            type='signing_url',
+            user_id=user_id,
+            success=False,
+            reason=f'Failed to generate signing URL: {str(e)}',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.error(f"Failed to generate signing URL for {user.username}: {str(e)}")
+        return jsonify({"message": "Failed to generate signing URL"}), 500
