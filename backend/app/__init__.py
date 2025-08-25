@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, send_from_directory
 from decouple import config
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
@@ -12,7 +12,7 @@ migrate = Migrate()
 jwt = JWTManager()
 
 def create_app():
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder='static')
 
     # Config
     app.config['SECRET_KEY'] = config('SECRET_KEY')
@@ -33,6 +33,16 @@ def create_app():
     # Register blueprints
     from .routes import routes
     app.register_blueprint(routes)
+
+    # Serve sponsor approval page
+    @app.route('/sponsor_approve')
+    def serve_sponsor_approve():
+        return send_from_directory('static', 'sponsor_approve.html')
+
+    # Serve dashboard page
+    @app.route('/dashboard')
+    def serve_dashboard():
+        return send_from_directory('static', 'dashboard.html')
 
     with app.app_context():
         db.create_all()

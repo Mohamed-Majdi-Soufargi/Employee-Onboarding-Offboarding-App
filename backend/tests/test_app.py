@@ -510,6 +510,40 @@ def create_test_app():
         logger.info(f"User {user_to_deactivate.username} deactivated by {current_user.username} from IP {ip}")
         return jsonify({"message": f'User {user_to_deactivate.username} deactivated successfully'}), 200
     
+    @routes.route('/pending_approvals', methods=['GET'])
+    @jwt_required()
+    def pending_approvals():
+        from flask import request, jsonify
+        user_id = get_jwt_identity()
+        ip = request.remote_addr
+        user = test_app.db.session.get(test_app.User, int(user_id))
+        if not user:
+            logger.error(f"User not found for id: {user_id}")
+            audit = test_app.AuditLog(type='hr_access', user_id=None, success=False, reason='User not found', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            return jsonify({"message": "User not found"}), 404
+        if user.type != 'hr':
+            logger.warning(f"Unauthorized access to pending approvals by {user.username} (role: {user.type}) from IP {ip}")
+            audit = test_app.AuditLog(type='hr_access', user_id=user.id, success=False, reason='HR access required', ip_address=ip)
+            test_app.db.session.add(audit)
+            test_app.db.session.commit()
+            return jsonify({"message": "HR access required"}), 403
+        pending_users = test_app.User.query.filter_by(sponsor_email=user.email, is_active=False).all()
+        audit = test_app.AuditLog(type='hr_access', user_id=user.id, success=True, reason='Viewed pending approvals', ip_address=ip)
+        test_app.db.session.add(audit)
+        test_app.db.session.commit()
+        logger.info(f"HR user {user.username} accessed pending approvals from IP {ip}")
+        return jsonify({
+            "pending_approvals": [{
+                "id": u.id,
+                "username": u.username,
+                "email": u.email,
+                "role": u.type,
+                "approval_token": u.approval_token
+            } for u in pending_users]
+        }), 200
+    
     # Register the Blueprint
     test_app.register_blueprint(routes)
     
@@ -1255,4 +1289,92 @@ def test_deactivate_user(app, client):
         assert response.json['message'] == 'User already deactivated'
         audit = app.AuditLog.query.filter_by(type='hr_access', success=False, reason='User already deactivated').first()
         assert audit is not None
+        app.db.drop_all()
+
+# Test pending approvals route access
+def test_pending_approvals_access(client, app):
+    with app.app_context():
+        app.db.create_all()
+        hr_user = app.HR(
+            username="hruser",
+            email="hr@example.com",
+            sponsor_email="sponsor@example.com",
+            is_active=True
+        )
+        hr_user.set_password("Test123!")
+        pending_user = app.Employee(
+            username="pendinguser",
+            email="pending@example.com",
+            sponsor_email="hr@example.com",
+            approval_token=str(uuid.uuid4()),
+            is_active=False
+        )
+        pending_user.set_password("Test123!")
+        other_user = app.Employee(
+            username="otheruser",
+            email="other@example.com",
+            sponsor_email="other.sponsor@example.com",
+            is_active=False
+        )
+        other_user.set_password("Test123!")
+        emp_user = app.Employee(
+            username="empuser",
+            email="emp@example.com",
+            sponsor_email="sponsor@example.com",
+            is_active=True
+        )
+        emp_user.set_password("Test123!")
+        app.db.session.add_all([hr_user, pending_user, other_user, emp_user])
+        app.db.session.commit()
+        hr_token = create_access_token(identity=str(hr_user.id))
+        emp_token = create_access_token(identity=str(emp_user.id))
+    
+        # Test HR user accessing pending approvals
+        response = client.get('/pending_approvals', headers={'Authorization': f'Bearer {hr_token}'})
+        assert response.status_code == 200
+        assert response.json['pending_approvals'] is not None
+        assert len(response.json['pending_approvals']) == 1
+        assert response.json['pending_approvals'][0]['username'] == 'pendinguser'
+        assert response.json['pending_approvals'][0]['email'] == 'pending@example.com'
+        assert response.json['pending_approvals'][0]['role'] == 'employee'
+        assert response.json['pending_approvals'][0]['approval_token'] == pending_user.approval_token
+        audit = app.AuditLog.query.filter_by(type='hr_access', success=True, reason='Viewed pending approvals').first()
+        assert audit is not None
+        assert audit.user_id == hr_user.id
+    
+        # Test non-HR user accessing pending approvals
+        response = client.get('/pending_approvals', headers={'Authorization': f'Bearer {emp_token}'})
+        assert response.status_code == 403
+        assert response.json == {"message": "HR access required"}
+        audit = app.AuditLog.query.filter_by(type='hr_access', success=False, reason='HR access required').first()
+        assert audit is not None
+        assert audit.user_id == emp_user.id
+    
+        # Test access with no token
+        response = client.get('/pending_approvals')
+        assert response.status_code == 401
+        assert response.json.get('msg') == 'Missing Authorization Header'
+    
+        # Test access with invalid token
+        response = client.get('/pending_approvals', headers={'Authorization': 'Bearer invalidtoken'})
+        assert response.status_code == 422
+        assert response.json.get('msg') == 'Not enough segments'
+    
+        # Test when no pending approvals exist for the HR user
+        hr_user2 = app.HR(
+            username="hruser2",
+            email="hr2@example.com",
+            sponsor_email="sponsor@example.com",
+            is_active=True
+        )
+        hr_user2.set_password("Test123!")
+        app.db.session.add(hr_user2)
+        app.db.session.commit()
+        hr_token2 = create_access_token(identity=str(hr_user2.id))
+        response = client.get('/pending_approvals', headers={'Authorization': f'Bearer {hr_token2}'})
+        assert response.status_code == 200
+        assert response.json['pending_approvals'] == []
+        audit = app.AuditLog.query.filter_by(type='hr_access', success=True, reason='Viewed pending approvals', user_id=hr_user2.id).first()
+        assert audit is not None
+    
         app.db.drop_all()

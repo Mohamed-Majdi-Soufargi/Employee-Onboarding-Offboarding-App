@@ -15,6 +15,7 @@ class User(db.Model):
     is_active = db.Column(db.Boolean, default=False)
     approval_token = db.Column(db.String(36), unique=True, nullable=True)
     sponsor_email = db.Column(db.String(120), nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=True)
     type = db.Column(db.String(50))
 
     __mapper_args__ = {
@@ -23,12 +24,12 @@ class User(db.Model):
     }
 
     def set_password(self, password):
-        self.password_hash = password
-        #self.password_hash = generate_password_hash(password)
+        #self.password_hash = password #will change it later on don't for know
+        self.password_hash = generate_password_hash(password)
 
     def check_password(self, password):
-        return self.password_hash == password
-        #return check_password_hash(self.password_hash, password)
+        #return self.password_hash == password #will change it later on don't for know
+        return check_password_hash(self.password_hash, password)
 
 class Employee(User):
     __tablename__ = 'employees'

@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify
 from .models import User, AuditLog, MFACode, SponsorApproval, Employee, HR, IT
-from flask_jwt_extended import create_access_token
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from datetime import datetime, timedelta, timezone
 import random
 import string
@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Define the Blueprint
-routes = Blueprint("routes", __name__)
+routes = Blueprint("routes", __name__, url_prefix='/api')
 
 # Initialize db here to avoid circular import
 from . import db
@@ -86,7 +86,7 @@ def send_sponsor_email(sponsor_email, token, username):
     smtp_username = config('SMTP_USERNAME')
     smtp_password = config('SMTP_PASSWORD')
     
-    approval_url = f"{config('BASE_URL')}/sponsor_approve?token={token}"
+    approval_url = f"{config('BASE_URL', default='http://127.0.0.1:5000')}/sponsor_approve?token={token}"
     msg = MIMEMultipart('alternative')
     msg['Subject'] = 'Sponsor Approval Request'
     msg['From'] = smtp_username
@@ -161,6 +161,56 @@ def send_confirmation_email(email, context="registration_confirmation"):
     except Exception as e:
         logger.error(f"Error sending confirmation email to {email}: {e}")
         return False
+
+@routes.route('/protected', methods=['GET'])
+@jwt_required()
+def protected():
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({"message": "User not found"}), 404
+    return jsonify({"message": f"Welcome, {user.username}!", "username": user.username, "role": user.type}), 200
+
+@routes.route('/hr/users', methods=['GET'])
+@jwt_required()
+def hr_users():
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    if not user or user.type != 'hr':
+        return jsonify({"message": "Unauthorized"}), 403
+    users = User.query.all()
+    return jsonify([{
+        "id": u.id,
+        "username": u.username,
+        "email": u.email,
+        "role": u.type,
+        "is_active": u.is_active,
+        "sponsor_email": u.sponsor_email
+    } for u in users]), 200
+
+@routes.route('/hr/users/<int:user_id>/deactivate', methods=['POST'])
+@jwt_required()
+def deactivate_user(user_id):
+    user_id_auth = get_jwt_identity()
+    user = User.query.get(user_id_auth)
+    if not user or user.type != 'hr':
+        return jsonify({"message": "Unauthorized"}), 403
+    target_user = User.query.get(user_id)
+    if not target_user:
+        return jsonify({"message": "User not found"}), 404
+    target_user.is_active = False
+    db.session.commit()
+    audit = AuditLog(
+        type='deactivate',
+        user_id=user_id,
+        success=True,
+        reason=f'User {target_user.username} deactivated by {user.username}',
+        ip_address=request.remote_addr
+    )
+    db.session.add(audit)
+    db.session.commit()
+    logger.info(f"User {target_user.username} deactivated by {user.username}")
+    return jsonify({"message": "User deactivated successfully"}), 200
 
 @routes.route('/register', methods=['POST'])
 def register():
@@ -263,6 +313,7 @@ def verify_registration_mfa():
         email=data['email'],
         sponsor_email=data['sponsor_email'],
         approval_token=str(uuid.uuid4()),
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
         is_active=False
     )
     user.set_password(data['password'])
@@ -285,52 +336,111 @@ def verify_registration_mfa():
     logger.info(f"Successful MFA verification for registration of {email} from IP {ip}. Pending user created.")
     return jsonify({"message": "Sponsor approval request sent. Awaiting approval."}), 200
 
-@routes.route('/sponsor_approve', methods=['POST'])
+@routes.route('/sponsor_approve', methods=['GET', 'POST'])
 def sponsor_approve():
-    data = request.get_json()
-    token = data.get('token')
-    approve = data.get('approve', False)
     ip = request.remote_addr
-    
-    user = User.query.filter_by(approval_token=token).first()
+
+    if request.method == 'GET':
+        token = request.args.get('token')
+        if not token:
+            audit = AuditLog(type='sponsor', user_id=None, success=False, reason='Missing token', ip_address=ip)
+            db.session.add(audit)
+            db.session.commit()
+            logger.warning(f"Failed sponsor approval: missing token from IP {ip}")
+            return jsonify({"message": "Missing token"}), 400
+
+        user = User.query.filter_by(approval_token=token).filter(
+            User.expires_at > datetime.now(timezone.utc)
+        ).first()
+        if not user:
+            audit = AuditLog(type='sponsor', user_id=None, success=False, reason='Invalid or expired token', ip_address=ip)
+            db.session.add(audit)
+            db.session.commit()
+            logger.warning(f"Failed sponsor approval: invalid token from IP {ip}")
+            return jsonify({"message": "Invalid or expired token"}), 404
+
+        return jsonify({"message": "Valid token", "username": user.username}), 200
+
+    elif request.method == 'POST':
+        data = request.get_json()
+        token = data.get('token')
+        approve = data.get('approve', False)
+        
+        user = User.query.filter_by(approval_token=token).filter(
+            User.expires_at > datetime.now(timezone.utc)
+        ).first()
+        
+        if not user:
+            audit = AuditLog(type='sponsor', user_id=None, success=False, reason='Invalid or expired token', ip_address=ip)
+            db.session.add(audit)
+            db.session.commit()
+            logger.warning(f"Failed sponsor approval: invalid token from IP {ip}")
+            return jsonify({"message": "Invalid or expired token"}), 404
+        
+        # Log sponsor action
+        sponsor_approval = SponsorApproval(
+            user_id=user.id,
+            sponsor_email=user.sponsor_email,
+            approved=approve
+        )
+        db.session.add(sponsor_approval)
+        
+        if not approve:
+            audit = AuditLog(type='sponsor', user_id=user.id, success=False, reason='Sponsor rejected request', ip_address=ip)
+            db.session.add(audit)
+            # Delete pending user on rejection
+            db.session.delete(user)
+            db.session.commit()
+            logger.info(f"Sponsor rejected registration for {user.username} from IP {ip}")
+            return jsonify({"message": "Registration request rejected by sponsor"}), 200
+        
+        # Activate user
+        user.is_active = True
+        user.approval_token = None  # Clear token
+        user.expires_at = None  # Clear expiration
+        audit = AuditLog(type='sponsor', user_id=user.id, success=True, reason='Sponsor approved', ip_address=ip)
+        db.session.add(audit)
+        db.session.commit()
+        
+        # Send confirmation email to user
+        send_confirmation_email(user.email)
+        
+        logger.info(f"User {user.username} activated after sponsor approval from IP {ip}")
+        return jsonify({"message": "User activated successfully"}), 201
+
+@routes.route('/pending_approvals', methods=['GET'])
+@jwt_required()
+def pending_approvals():
+    ip = request.remote_addr
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
     
     if not user:
-        audit = AuditLog(type='sponsor', user_id=None, success=False, reason='Invalid or expired token', ip_address=ip)
+        audit = AuditLog(type='pending_approvals', user_id=None, success=False, reason='User not found', ip_address=ip)
         db.session.add(audit)
         db.session.commit()
-        logger.warning(f"Failed sponsor approval: invalid token from IP {ip}")
-        return jsonify({"message": "Invalid or expired token"}), 404
+        logger.warning(f"Failed to fetch pending approvals: user not found from IP {ip}")
+        return jsonify({"message": "User not found"}), 404
     
-    # Log sponsor action
-    sponsor_approval = SponsorApproval(
-        user_id=user.id,
-        sponsor_email=user.sponsor_email,
-        approved=approve
-    )
-    db.session.add(sponsor_approval)
+    # For HR users, show all pending approvals
+    # For other users, show only approvals where they are the sponsor
+    if user.type == 'hr':
+        pending_users = User.query.filter_by(is_active=False).filter(User.approval_token.isnot(None)).all()
+    else:
+        pending_users = User.query.filter_by(sponsor_email=user.email, is_active=False).filter(User.approval_token.isnot(None)).all()
     
-    if not approve:
-        audit = AuditLog(type='sponsor', user_id=user.id, success=False, reason='Sponsor rejected request', ip_address=ip)
-        db.session.add(audit)
-        # Delete pending user on rejection
-        db.session.delete(user)
-        db.session.commit()
-        logger.info(f"Sponsor rejected registration for {user.username} from IP {ip}")
-        return jsonify({"message": "Registration request rejected by sponsor"}), 200
+    approvals = [{
+        "id": pending_user.id,
+        "username": pending_user.username,
+        "email": pending_user.email,
+        "role": pending_user.type,
+        "approval_token": pending_user.approval_token,
+        "sponsor_email": pending_user.sponsor_email
+    } for pending_user in pending_users]
     
-    # Activate user
-    user.is_active = True
-    user.approval_token = None  # Clear token
-    audit = AuditLog(type='sponsor', user_id=user.id, success=True, reason='Sponsor approved', ip_address=ip)
-    db.session.add(audit)
-    db.session.commit()
+    logger.info(f"Fetched {len(approvals)} pending approvals for user {user.username} from IP {ip}")
+    return jsonify({"pending_approvals": approvals}), 200
     
-    # Send confirmation email to user
-    send_confirmation_email(user.email)
-    
-    logger.info(f"User {user.username} activated after sponsor approval from IP {ip}")
-    return jsonify({"message": "User activated successfully"}), 201
-
 @routes.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -412,7 +522,7 @@ def verify_mfa():
         logger.warning(f"Failed MFA verification: invalid code for {username} from IP {ip}")
         return jsonify({"message": "Invalid or expired MFA code"}), 401
     
-    access_token = create_access_token(identity=user.id)
+    access_token = create_access_token(identity=str(user.id))
     user.last_login = datetime.now(timezone.utc)
     user.failed_attempts = 0
     audit = AuditLog(type='mfa', user_id=user.id, success=True, reason='Login successful', ip_address=ip)
@@ -421,4 +531,4 @@ def verify_mfa():
     db.session.commit()
     
     logger.info(f"Successful MFA verification for {username} from IP {ip}")
-    return jsonify({"access_token": access_token}), 200
+    return jsonify({"access_token": access_token, "role": user.type}), 200

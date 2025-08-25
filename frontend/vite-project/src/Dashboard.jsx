@@ -2,42 +2,62 @@ import { useState, useEffect } from 'react';
 import axios from 'axios';
 import { useNavigate } from 'react-router-dom';
 
+// Set the base URL for Axios to point to the Flask backend
+axios.defaults.baseURL = 'http://localhost:5000';
+
 function Dashboard() {
   const [userData, setUserData] = useState(null);
   const [hrUsers, setHrUsers] = useState([]);
-  const [itConfig, setItConfig] = useState(null);
+  const [pendingApprovals, setPendingApprovals] = useState([]);
   const [error, setError] = useState('');
   const role = localStorage.getItem('role');
   const navigate = useNavigate();
 
   useEffect(() => {
+    console.log('Role from localStorage:', role);
+    console.log('Token from localStorage:', localStorage.getItem('token'));
+
     const fetchData = async () => {
       const token = localStorage.getItem('token');
       if (!token) {
+        console.log('No token found, redirecting to login');
         navigate('/');
         return;
       }
 
       try {
+        console.log('Fetching /api/protected with token:', token);
         const protectedResponse = await axios.get('/api/protected', {
           headers: { Authorization: `Bearer ${token}` }
         });
         setUserData(protectedResponse.data);
+        console.log('Protected response:', protectedResponse.data);
 
         if (role === 'hr') {
+          console.log('Fetching /api/hr/users');
           const hrResponse = await axios.get('/api/hr/users', {
             headers: { Authorization: `Bearer ${token}` }
           });
           setHrUsers(hrResponse.data);
-        } else if (role === 'it') {
-          const itResponse = await axios.get('/api/it/config', {
+          console.log('HR users response:', hrResponse.data);
+
+          console.log('Fetching /api/pending_approvals');
+          const approvalsResponse = await axios.get('/api/pending_approvals', {
             headers: { Authorization: `Bearer ${token}` }
           });
-          setItConfig(itResponse.data.config);
+          setPendingApprovals(approvalsResponse.data.pending_approvals || []);
+          console.log('Pending approvals response:', approvalsResponse.data);
+          console.log('Pending approvals state:', approvalsResponse.data.pending_approvals || []);
         }
       } catch (err) {
         setError(err.response?.data?.message || 'Failed to fetch data');
+        console.error('Error details:', {
+          status: err.response?.status,
+          data: err.response?.data,
+          message: err.message
+        });
         if (err.response?.status === 401 || err.response?.status === 403) {
+          console.log('Unauthorized or Forbidden, clearing localStorage and redirecting');
           localStorage.removeItem('token');
           localStorage.removeItem('role');
           navigate('/');
@@ -50,6 +70,7 @@ function Dashboard() {
 
   const handleDeactivate = async (userId) => {
     try {
+      console.log('Deactivating user:', userId);
       await axios.post(`/api/hr/users/${userId}/deactivate`, {}, {
         headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
       });
@@ -58,10 +79,28 @@ function Dashboard() {
       ));
     } catch (err) {
       setError(err.response?.data?.message || 'Failed to deactivate user');
+      console.error('Deactivation error:', err);
+    }
+  };
+
+  const handleApprovalAction = async (approvalToken, approve) => {
+    try {
+      console.log('Processing approval, token:', approvalToken, 'approve:', approve);
+      const response = await axios.post('/api/sponsor_approve', 
+        { token: approvalToken, approve },
+        { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } }
+      );
+      setPendingApprovals(pendingApprovals.filter(approval => approval.approval_token !== approvalToken));
+      setError(response.data.message);
+      console.log('Approval response:', response.data);
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to process approval');
+      console.error('Approval error:', err);
     }
   };
 
   const handleLogout = () => {
+    console.log('Logging out');
     localStorage.removeItem('token');
     localStorage.removeItem('role');
     navigate('/');
@@ -85,6 +124,51 @@ function Dashboard() {
         <div className="bg-white p-6 rounded-lg shadow-md mb-6">
           <h2 className="text-xl font-semibold mb-4">{userData.message}</h2>
           <p>Role: {role}</p>
+        </div>
+      )}
+
+      {role === 'hr' && (
+        <div className="bg-white p-6 rounded-lg shadow-md mb-6">
+          <h2 className="text-xl font-semibold mb-4">Pending Sponsor Approvals</h2>
+          {pendingApprovals.length === 0 ? (
+            <p>No pending approvals.</p>
+          ) : (
+            <table className="w-full border-collapse">
+              <thead>
+                <tr className="bg-gray-200">
+                  <th className="border p-2">ID</th>
+                  <th className="border p-2">Username</th>
+                  <th className="border p-2">Email</th>
+                  <th className="border p-2">Role</th>
+                  <th className="border p-2">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pendingApprovals.map((approval) => (
+                  <tr key={approval.id}>
+                    <td className="border p-2">{approval.id}</td>
+                    <td className="border p-2">{approval.username}</td>
+                    <td className="border p-2">{approval.email}</td>
+                    <td className="border p-2">{approval.role}</td>
+                    <td className="border p-2 flex space-x-2">
+                      <button
+                        onClick={() => handleApprovalAction(approval.approval_token, true)}
+                        className="bg-green-500 text-white px-2 py-1 rounded-md hover:bg-green-600"
+                      >
+                        Approve
+                      </button>
+                      <button
+                        onClick={() => handleApprovalAction(approval.approval_token, false)}
+                        className="bg-red-500 text-white px-2 py-1 rounded-md hover:bg-red-600"
+                      >
+                        Reject
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       )}
 
@@ -126,15 +210,6 @@ function Dashboard() {
               ))}
             </tbody>
           </table>
-        </div>
-      )}
-
-      {role === 'it' && itConfig && (
-        <div className="bg-white p-6 rounded-lg shadow-md">
-          <h2 className="text-xl font-semibold mb-4">System Configuration</h2>
-          <p><strong>System Version:</strong> {itConfig.system_version}</p>
-          <p><strong>MFA Enabled:</strong> {itConfig.mfa_enabled ? 'Yes' : 'No'}</p>
-          <p><strong>Max Login Attempts:</strong> {itConfig.max_login_attempts}</p>
         </div>
       )}
 
