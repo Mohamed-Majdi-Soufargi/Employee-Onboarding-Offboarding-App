@@ -46,7 +46,7 @@ def create_app():
 
     with app.app_context():
         db.create_all()
-        # Create initial HR user if no HR users exist
+        # Create initial HR user if no HR users exist (just for testing)
         if not db.session.query(HR).first():
             initial_user = HR(
                 username='admin',

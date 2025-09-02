@@ -1,0 +1,47 @@
+.video-wrapper {
+  background-color: #f0f0f0;
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+  width: 100%;
+  max-width: 800px;
+  margin: 0 auto 1.5rem;
+
+  position: relative;
+  width: 100%;
+  max-width: 800px; /* Optional: limits maximum width for larger screens */
+  margin: 0 auto 1.5rem; /* Centers and adds space below */
+}
+
+.video-wrapper::before {
+  content: '';
+  display: block;
+  padding-top: 56.25%; /* 16:9 Aspect Ratio (9 / 16 * 100) */
+}
+
+.video-wrapper iframe {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+.container {
+  min-height: 0;
+  height: auto;
+}
+
+body {
+  scroll-behavior: smooth;
+  margin: 20;
+}
+
+@media (max-width: 640px) {
+  .video-wrapper {
+    max-width: 100%; /* Full width on smaller screens */
+  }
+}
+
+

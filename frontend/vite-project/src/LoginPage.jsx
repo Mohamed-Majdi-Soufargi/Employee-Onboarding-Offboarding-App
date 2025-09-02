@@ -13,12 +13,9 @@ function LoginPage() {
   const handleLogin = async (e) => {
     e.preventDefault();
     try {
-      const response = await axios.post('/api/login', { username, password });
+      await axios.post('/api/login', { username, password });
       setStep('mfa');
       setError('');
-      if (response.data.mfa_code) {
-        console.log(`MFA code for testing: ${response.data.mfa_code}`);
-      }
     } catch (err) {
       setError(err.response?.data?.message || 'Login failed');
     }
@@ -28,7 +25,7 @@ function LoginPage() {
     e.preventDefault();
     try {
       const response = await axios.post('/api/verify_mfa', { username, mfa_code: mfaCode });
-      localStorage.setItem('token', response.data.access_token);
+      localStorage.setItem('access_token', response.data.access_token);
       localStorage.setItem('role', response.data.role || 'employee');
       navigate('/dashboard');
     } catch (err) {
@@ -43,25 +40,29 @@ function LoginPage() {
           <form onSubmit={handleLogin}>
             <h2 className="text-2xl font-bold mb-6 text-center">Login</h2>
             <div className="mb-4">
-              <label className="block text-gray-700 mb-2" htmlFor="username">Username</label>
+              <label className="block text-gray-700 mb-2" htmlFor="username">
+                Username
+              </label>
               <input
                 type="text"
                 id="username"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                className="w-full p-2 border rounded-md"
+                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                 placeholder="Username"
                 required
               />
             </div>
             <div className="mb-6">
-              <label className="block text-gray-700 mb-2" htmlFor="password">Password</label>
+              <label className="block text-gray-700 mb-2" htmlFor="password">
+                Password
+              </label>
               <input
                 type="password"
                 id="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="w-full p-2 border rounded-md"
+                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                 placeholder="Password"
                 required
               />
@@ -74,7 +75,9 @@ function LoginPage() {
             </button>
             <p className="mt-4 text-center">
               Don’t have an account?{' '}
-              <a href="/register" className="text-blue-500 hover:underline">Register</a>
+              <a href="/register" className="text-blue-500 hover:underline">
+                Register
+              </a>
             </p>
             {error && <p className="mt-4 text-red-500 text-center">{error}</p>}
           </form>
@@ -82,13 +85,15 @@ function LoginPage() {
           <form onSubmit={handleMfa}>
             <h2 className="text-2xl font-bold mb-6 text-center">Enter MFA Code</h2>
             <div className="mb-4">
-              <label className="block text-gray-700 mb-2" htmlFor="mfaCode">MFA Code</label>
+              <label className="block text-gray-700 mb-2" htmlFor="mfaCode">
+                MFA Code
+              </label>
               <input
                 type="text"
                 id="mfaCode"
                 value={mfaCode}
                 onChange={(e) => setMfaCode(e.target.value)}
-                className="w-full p-2 border rounded-md"
+                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                 placeholder="MFA Code"
                 required
               />
