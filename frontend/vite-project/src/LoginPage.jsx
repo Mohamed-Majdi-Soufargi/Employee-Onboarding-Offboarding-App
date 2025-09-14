@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import axios from 'axios';
 import { useNavigate } from 'react-router-dom';
+import './LoginPage.css';
 
 function LoginPage() {
   const [username, setUsername] = useState('');
@@ -13,7 +14,7 @@ function LoginPage() {
   const handleLogin = async (e) => {
     e.preventDefault();
     try {
-      await axios.post('/api/login', { username, password });
+      await axios.post('http://localhost:5000/api/login', { username, password });
       setStep('mfa');
       setError('');
     } catch (err) {
@@ -24,7 +25,7 @@ function LoginPage() {
   const handleMfa = async (e) => {
     e.preventDefault();
     try {
-      const response = await axios.post('/api/verify_mfa', { username, mfa_code: mfaCode });
+      const response = await axios.post('http://localhost:5000/api/verify_mfa', { username, mfa_code: mfaCode });
       localStorage.setItem('access_token', response.data.access_token);
       localStorage.setItem('role', response.data.role || 'employee');
       navigate('/dashboard');
@@ -34,77 +35,59 @@ function LoginPage() {
   };
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-gray-100">
-      <div className="bg-white p-8 rounded-lg shadow-md w-full max-w-md">
+    <div className="login-container">
+      <div className="login-card">
         {step === 'login' ? (
-          <form onSubmit={handleLogin}>
-            <h2 className="text-2xl font-bold mb-6 text-center">Login</h2>
-            <div className="mb-4">
-              <label className="block text-gray-700 mb-2" htmlFor="username">
-                Username
-              </label>
+          <form onSubmit={handleLogin} className="form">
+            <h2 className="form-title">Login</h2>
+            <div className="form-group">
+              <label htmlFor="username" className="form-label">Username</label>
               <input
                 type="text"
                 id="username"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Username"
+                className="form-input"
+                placeholder="Enter your username"
                 required
               />
             </div>
-            <div className="mb-6">
-              <label className="block text-gray-700 mb-2" htmlFor="password">
-                Password
-              </label>
+            <div className="form-group">
+              <label htmlFor="password" className="form-label">Password</label>
               <input
                 type="password"
                 id="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Password"
+                className="form-input"
+                placeholder="Enter your password"
                 required
               />
             </div>
-            <button
-              type="submit"
-              className="w-full bg-blue-500 text-white p-2 rounded-md hover:bg-blue-600"
-            >
-              Login
-            </button>
-            <p className="mt-4 text-center">
+            <button type="submit" className="form-button">Login</button>
+            <p className="form-link">
               Don’t have an account?{' '}
-              <a href="/register" className="text-blue-500 hover:underline">
-                Register
-              </a>
+              <a href="/register" className="link">Register</a>
             </p>
-            {error && <p className="mt-4 text-red-500 text-center">{error}</p>}
+            {error && <p className="error-message">{error}</p>}
           </form>
         ) : (
-          <form onSubmit={handleMfa}>
-            <h2 className="text-2xl font-bold mb-6 text-center">Enter MFA Code</h2>
-            <div className="mb-4">
-              <label className="block text-gray-700 mb-2" htmlFor="mfaCode">
-                MFA Code
-              </label>
+          <form onSubmit={handleMfa} className="form">
+            <h2 className="form-title">Enter MFA Code</h2>
+            <div className="form-group">
+              <label htmlFor="mfaCode" className="form-label">MFA Code</label>
               <input
                 type="text"
                 id="mfaCode"
                 value={mfaCode}
                 onChange={(e) => setMfaCode(e.target.value)}
-                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="MFA Code"
+                className="form-input"
+                placeholder="Enter MFA code"
                 required
               />
             </div>
-            <button
-              type="submit"
-              className="w-full bg-blue-500 text-white p-2 rounded-md hover:bg-blue-600"
-            >
-              Verify
-            </button>
-            {error && <p className="mt-4 text-red-500 text-center">{error}</p>}
+            <button type="submit" className="form-button">Verify</button>
+            {error && <p className="error-message">{error}</p>}
           </form>
         )}
       </div>

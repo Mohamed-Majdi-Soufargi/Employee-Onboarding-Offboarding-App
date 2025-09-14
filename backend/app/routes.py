@@ -11,7 +11,6 @@ from decouple import config
 import logging
 import re
 import uuid
-import jwt
 import requests
 import boto3
 from sqlalchemy import text
@@ -21,6 +20,8 @@ from werkzeug.utils import secure_filename
 from docusign_esign import ApiClient, EnvelopesApi, Document, Signer, SignHere, Tabs, Recipients, EnvelopeDefinition
 import os
 import tempfile
+import base64
+from io import BytesIO
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -31,6 +32,9 @@ routes = Blueprint("routes", __name__, url_prefix='/api')
 
 # Initialize db here to avoid circular import
 from . import db
+
+# In-memory cache for envelope_ids
+ENVELOPE_CACHE = {}
 
 def generate_mfa_code(length=6):
     """Generate a random 6-digit MFA code."""
@@ -178,6 +182,7 @@ def protected():
     user_id = get_jwt_identity()
     user = User.query.get(user_id)
     if not user:
+        logger.error(f"User not found for ID {user_id}")
         return jsonify({"message": "User not found"}), 404
     return jsonify({"message": f"Welcome, {user.username}!", "username": user.username, "role": user.type}), 200
 
@@ -187,6 +192,7 @@ def hr_users():
     user_id = get_jwt_identity()
     user = User.query.get(user_id)
     if not user or user.type != 'hr':
+        logger.error(f"Unauthorized access to /hr/users by user_id {user_id}")
         return jsonify({"message": "Unauthorized"}), 403
     users = User.query.all()
     return jsonify([{
@@ -204,9 +210,11 @@ def deactivate_user(user_id):
     user_id_auth = get_jwt_identity()
     user = User.query.get(user_id_auth)
     if not user or user.type != 'hr':
+        logger.error(f"Unauthorized deactivate attempt by user_id {user_id_auth}")
         return jsonify({"message": "Unauthorized"}), 403
     target_user = User.query.get(user_id)
     if not target_user:
+        logger.error(f"Target user_id {user_id} not found")
         return jsonify({"message": "User not found"}), 404
     target_user.is_active = False
     db.session.commit()
@@ -227,7 +235,6 @@ def register():
     data = request.get_json()
     ip = request.remote_addr
     
-    # Validate input
     required_fields = ['username', 'email', 'password', 'password_confirmation', 'sponsor_email', 'role']
     if not all(key in data for key in required_fields):
         audit = AuditLog(type='register', user_id=None, success=False, reason='Missing required fields', ip_address=ip)
@@ -243,7 +250,6 @@ def register():
         logger.warning(f"Failed registration attempt: passwords do not match from IP {ip}")
         return jsonify({"message": "Passwords do not match"}), 400
     
-    # Validate role
     if data['role'] not in ['employee', 'hr', 'it']:
         audit = AuditLog(type='register', user_id=None, success=False, reason='Invalid role', ip_address=ip)
         db.session.add(audit)
@@ -251,7 +257,6 @@ def register():
         logger.warning(f"Failed registration attempt: invalid role {data['role']} from IP {ip}")
         return jsonify({"message": "Invalid role"}), 400
     
-    # Check for existing username or email
     if User.query.filter_by(username=data['username']).first() or User.query.filter_by(email=data['email']).first():
         audit = AuditLog(type='register', user_id=None, success=False, reason='Username or email already exists', ip_address=ip)
         db.session.add(audit)
@@ -259,7 +264,6 @@ def register():
         logger.warning(f"Failed registration attempt: username {data['username']} or email {data['email']} already exists from IP {ip}")
         return jsonify({"message": "Username or email already exists"}), 400
     
-    # Validate password strength
     is_valid, reason = validate_password(data['password'])
     if not is_valid:
         audit = AuditLog(type='register', user_id=None, success=False, reason=reason, ip_address=ip)
@@ -268,18 +272,15 @@ def register():
         logger.warning(f"Failed registration attempt: weak password for {data['username']} from IP {ip}")
         return jsonify({"message": reason}), 400
     
-    # Generate and store MFA code associated with email
     mfa_code = generate_mfa_code()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     mfa_entry = MFACode(email=data['email'], code=mfa_code, expires_at=expires_at)
     db.session.add(mfa_entry)
     
-    # Log attempt
     audit = AuditLog(type='register', user_id=None, success=True, reason='MFA code sent', ip_address=ip)
     db.session.add(audit)
     db.session.commit()
     
-    # Send MFA code
     if not send_mfa_email(data['email'], mfa_code, context='registration'):
         logger.error(f"Failed to send MFA code to {data['email']} for registration")
         return jsonify({"message": "Failed to send MFA code"}), 500
@@ -554,7 +555,6 @@ def refresh_zoom_token():
         )
         if response.status_code == 200:
             token_data = response.json()
-            # Update .env or a secure storage with new tokens (simplified here)
             logger.info("Zoom access token refreshed successfully")
             return token_data['access_token']
         else:
@@ -568,7 +568,6 @@ def create_zoom_meeting(user_id):
     """Create a Zoom meeting with token refresh handling."""
     access_token = config('ZOOM_ACCESS_TOKEN', default=None)
     
-    # Attempt to refresh token if invalid or expired
     if not access_token:
         access_token = refresh_zoom_token()
         if not access_token:
@@ -589,7 +588,6 @@ def create_zoom_meeting(user_id):
             meeting = response.json()
             return {'join_url': meeting['join_url'], 'meeting_id': meeting['id']}
         else:
-            # Attempt to refresh token and retry once
             access_token = refresh_zoom_token()
             if access_token:
                 headers['Authorization'] = f'Bearer {access_token}'
@@ -801,7 +799,7 @@ def get_docusign_client():
 @routes.route('/policies', methods=['GET'])
 @jwt_required()
 def get_policies():
-    """Fetch all policies."""
+    """Fetch all policies with envelope_id and signed status."""
     ip = request.remote_addr
     user_id = get_jwt_identity()
     user = User.query.get(user_id)
@@ -820,6 +818,23 @@ def get_policies():
         return jsonify({"message": "Unauthorized or account not active"}), 403
 
     policies = Policy.query.all()
+    policy_data = []
+    for p in policies:
+        # Parse envelope_id from content (format: description||envelope_id:<id>)
+        envelope_id = None
+        description = p.content
+        if '||envelope_id:' in p.content:
+            description, envelope_id = p.content.split('||envelope_id:', 1)
+        # Check if policy is signed by user
+        signed = SignedPolicy.query.filter_by(user_id=user_id, policy_id=p.id).first() is not None
+        policy_data.append({
+            'id': p.id,
+            'name': p.title,
+            'description': description,
+            'envelope_id': envelope_id or ENVELOPE_CACHE.get(f"{p.id}_{user_id}"),
+            'signed': signed
+        })
+    
     audit = AuditLog(
         type='policies_fetch',
         user_id=user_id,
@@ -831,12 +846,7 @@ def get_policies():
     db.session.commit()
     logger.info(f"Policies fetched for {user.username} from IP {ip}")
 
-    return jsonify([{
-        'id': p.id,
-        'title': p.title,
-        'content': p.content,
-        'version': p.version
-    } for p in policies]), 200
+    return jsonify(policy_data), 200
 
 @routes.route('/sign_policy', methods=['POST'])
 @jwt_required()
@@ -879,8 +889,38 @@ def sign_policy():
         api_client = get_docusign_client()
         envelopes_api = EnvelopesApi(api_client)
         
+        # Extract description for PDF content
+        description = policy.content
+        if '||envelope_id:' in policy.content:
+            description = policy.content.split('||envelope_id:')[0]
+        
+        # Create simple PDF without reportlab
+        pdf_content = f"""
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 44 >>
+stream
+BT /F1 12 Tf 100 700 Td ({policy.title}) Tj 100 680 Td ({description}) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+trailer
+<< /Root 1 0 R >>
+%%EOF
+"""
         doc = Document(
-            document_base64=policy.content.encode(),
+            document_base64=base64.b64encode(pdf_content.encode()).decode(),
             name=f'{policy.title}.pdf',
             file_extension='pdf',
             document_id='1'
@@ -910,7 +950,14 @@ def sign_policy():
         )
         envelope_summary = envelopes_api.create_envelope(config('DOCUSIGN_ACCOUNT_ID'), envelope_definition=envelope_definition)
         
-        signed_content = b'signed_pdf_bytes'  # Placeholder; replace with webhook data
+        # Store envelope_id in cache and update policy content
+        envelope_id = envelope_summary.envelope_id
+        ENVELOPE_CACHE[f"{policy_id}_{user_id}"] = envelope_id
+        policy.content = f"{description}||envelope_id:{envelope_id}"
+        db.session.commit()
+
+        # Placeholder for signed content; replace with webhook in production
+        signed_content = b'signed_pdf_bytes'
         encrypted_signed = db.session.execute(
             text("SELECT pgp_sym_encrypt(:content, :key)"),
             {'content': signed_content, 'key': config('PGCRYPTO_KEY')}
@@ -935,7 +982,7 @@ def sign_policy():
         db.session.commit()
         logger.info(f"Policy {policy.title} signed by {user.username} from IP {ip}")
 
-        return jsonify({"message": "Policy signing initiated", "envelope_id": envelope_summary.envelope_id}), 200
+        return jsonify({"message": "Policy signing initiated", "envelope_id": envelope_id}), 200
     except Exception as e:
         audit = AuditLog(
             type='policy_sign',
@@ -1008,3 +1055,75 @@ def get_signing_url():
         db.session.commit()
         logger.error(f"Failed to generate signing URL for {user.username}: {str(e)}")
         return jsonify({"message": "Failed to generate signing URL"}), 500
+
+@routes.route('/audit_logs', methods=['GET'])
+@jwt_required()
+def audit_logs():
+    ip = request.remote_addr
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    if not user or user.type != 'hr':
+        audit = AuditLog(
+            type='audit_logs',
+            user_id=user_id,
+            success=False,
+            reason='Unauthorized',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Unauthorized access to audit_logs by user_id {user_id} from IP {ip}")
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    logs = db.session.query(AuditLog, User.username).outerjoin(User, AuditLog.user_id == User.id).order_by(AuditLog.timestamp.desc()).all()
+    audit = AuditLog(
+        type='audit_logs',
+        user_id=user_id,
+        success=True,
+        reason='Audit logs fetched',
+        ip_address=ip
+    )
+    db.session.add(audit)
+    db.session.commit()
+    logger.info(f"Audit logs fetched for user_id {user_id} from IP {ip}")
+    return jsonify([{
+        "id": log.id,
+        "type": log.type,
+        "success": log.success,
+        "reason": log.reason,
+        "timestamp": log.timestamp.isoformat(),
+        "user_id": log.user_id,
+        "username": username if username else "N/A"
+    } for log, username in logs]), 200
+
+@routes.route('/check_logs', methods=['GET'])
+@jwt_required()
+def check_logs():
+    ip = request.remote_addr
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    if not user or user.type != 'hr':
+        audit = AuditLog(
+            type='check_logs',
+            user_id=user_id,
+            success=False,
+            reason='Unauthorized',
+            ip_address=ip
+        )
+        db.session.add(audit)
+        db.session.commit()
+        logger.warning(f"Unauthorized access to check_logs by user_id {user_id} from IP {ip}")
+        return jsonify({"message": "Unauthorized"}), 403
+    
+    log_count = AuditLog.query.count()
+    audit = AuditLog(
+        type='check_logs',
+        user_id=user_id,
+        success=True,
+        reason='Log count fetched',
+        ip_address=ip
+    )
+    db.session.add(audit)
+    db.session.commit()
+    logger.info(f"Log count fetched for user_id {user_id} from IP {ip}")
+    return jsonify({"log_count": log_count}), 200

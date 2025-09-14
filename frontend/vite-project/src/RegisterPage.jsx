@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import axios from 'axios';
 import { useNavigate } from 'react-router-dom';
+import './RegisterPage.css';
 
 function RegisterPage() {
   const [formData, setFormData] = useState({
@@ -24,8 +25,7 @@ function RegisterPage() {
   const handleRegister = async (e) => {
     e.preventDefault();
     try {
-      await axios.post('/api/register', formData);
-      // Store formData in localStorage for MFA step
+      await axios.post('http://localhost:5000/api/register', formData);
       localStorage.setItem('registration_data', JSON.stringify(formData));
       setStep('mfa');
       setError('');
@@ -39,7 +39,7 @@ function RegisterPage() {
   const handleMfa = async (e) => {
     e.preventDefault();
     try {
-      await axios.post('/api/verify_registration_mfa', { ...formData, mfa_code: mfaCode });
+      await axios.post('http://localhost:5000/api/verify_registration_mfa', { ...formData, mfa_code: mfaCode });
       localStorage.removeItem('registration_data');
       setSuccess('Registration submitted. Awaiting sponsor approval.');
       setError('');
@@ -51,90 +51,78 @@ function RegisterPage() {
   };
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-gray-100">
-      <div className="bg-white p-8 rounded-lg shadow-md w-full max-w-md">
+    <div className="register-container">
+      <div className="register-card">
         {step === 'register' ? (
-          <form onSubmit={handleRegister}>
-            <h2 className="text-2xl font-bold mb-6 text-center">Register</h2>
-            <div className="mb-4">
-              <label className="block text-gray-700 mb-2" htmlFor="username">
-                Username
-              </label>
+          <form onSubmit={handleRegister} className="form">
+            <h2 className="form-title">Register</h2>
+            <div className="form-group">
+              <label htmlFor="username" className="form-label">Username</label>
               <input
                 type="text"
                 name="username"
                 value={formData.username}
                 onChange={handleChange}
-                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Username"
+                className="form-input"
+                placeholder="Enter your username"
                 required
               />
             </div>
-            <div className="mb-4">
-              <label className="block text-gray-700 mb-2" htmlFor="email">
-                Email
-              </label>
+            <div className="form-group">
+              <label htmlFor="email" className="form-label">Email</label>
               <input
                 type="email"
                 name="email"
                 value={formData.email}
                 onChange={handleChange}
-                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Email"
+                className="form-input"
+                placeholder="Enter your email"
                 required
               />
             </div>
-            <div className="mb-4">
-              <label className="block text-gray-700 mb-2" htmlFor="password">
-                Password
-              </label>
+            <div className="form-group">
+              <label htmlFor="password" className="form-label">Password</label>
               <input
                 type="password"
                 name="password"
                 value={formData.password}
                 onChange={handleChange}
-                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Password"
+                className="form-input"
+                placeholder="Enter your password"
                 required
               />
             </div>
-            <div className="mb-4">
-              <label className="block text-gray-700 mb-2" htmlFor="password_confirmation">
-                Confirm Password
-              </label>
+            <div className="form-group">
+              <label htmlFor="password_confirmation" className="form-label">Confirm Password</label>
               <input
                 type="password"
                 name="password_confirmation"
                 value={formData.password_confirmation}
                 onChange={handleChange}
-                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Confirm Password"
+                className="form-input"
+                placeholder="Confirm your password"
                 required
               />
             </div>
-            <div className="mb-4">
-              <label className="block text-gray-700 mb-2" htmlFor="sponsor_email">
-                Sponsor Email
-              </label>
+            <div className="form-group">
+              <label htmlFor="sponsor_email" className="form-label">Sponsor Email</label>
               <input
                 type="email"
                 name="sponsor_email"
                 value={formData.sponsor_email}
                 onChange={handleChange}
-                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="Sponsor Email"
+                className="form-input"
+                placeholder="Enter sponsor email"
                 required
               />
             </div>
-            <div className="mb-6">
-              <label className="block text-gray-700 mb-2" htmlFor="role">
-                Role
-              </label>
+            <div className="form-group">
+              <label htmlFor="role" className="form-label">Role</label>
               <select
                 name="role"
                 value={formData.role}
                 onChange={handleChange}
-                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="form-input"
                 required
               >
                 <option value="employee">Employee</option>
@@ -142,46 +130,32 @@ function RegisterPage() {
                 <option value="it">IT</option>
               </select>
             </div>
-            <button
-              type="submit"
-              className="w-full bg-blue-500 text-white p-2 rounded-md hover:bg-blue-600"
-            >
-              Register
-            </button>
-            <p className="mt-4 text-center">
+            <button type="submit" className="form-button">Register</button>
+            <p className="form-link">
               Already have an account?{' '}
-              <a href="/" className="text-blue-500 hover:underline">
-                Login
-              </a>
+              <a href="/" className="link">Login</a>
             </p>
-            {error && <p className="mt-4 text-red-500 text-center">{error}</p>}
-            {success && <p className="mt-4 text-green-500 text-center">{success}</p>}
+            {error && <p className="error-message">{error}</p>}
+            {success && <p className="success-message">{success}</p>}
           </form>
         ) : (
-          <form onSubmit={handleMfa}>
-            <h2 className="text-2xl font-bold mb-6 text-center">Enter MFA Code</h2>
-            <div className="mb-4">
-              <label className="block text-gray-700 mb-2" htmlFor="mfaCode">
-                MFA Code
-              </label>
+          <form onSubmit={handleMfa} className="form">
+            <h2 className="form-title">Enter MFA Code</h2>
+            <div className="form-group">
+              <label htmlFor="mfaCode" className="form-label">MFA Code</label>
               <input
                 type="text"
                 name="mfaCode"
                 value={mfaCode}
                 onChange={(e) => setMfaCode(e.target.value)}
-                className="w-full p-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="MFA Code"
+                className="form-input"
+                placeholder="Enter MFA code"
                 required
               />
             </div>
-            <button
-              type="submit"
-              className="w-full bg-blue-500 text-white p-2 rounded-md hover:bg-blue-600"
-            >
-              Verify
-            </button>
-            {error && <p className="mt-4 text-red-500 text-center">{error}</p>}
-            {success && <p className="mt-4 text-green-500 text-center">{success}</p>}
+            <button type="submit" className="form-button">Verify</button>
+            {error && <p className="error-message">{error}</p>}
+            {success && <p className="success-message">{success}</p>}
           </form>
         )}
       </div>
